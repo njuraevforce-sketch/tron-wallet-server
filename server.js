@@ -291,18 +291,21 @@ async function transferUSDT(fromPrivateKey, toAddress, amount) {
       return false;
     }
 
+    // Создаем чистый экземпляр TronWeb без лишних заголовков
     const tronWebWithPrivateKey = new TronWeb({
       fullHost: 'https://api.trongrid.io',
-      headers: { 'TRON-PRO-API-KEY': TRONGRID_API_KEY },
       privateKey: pk
     });
+
+    // Устанавливаем заголовок отдельно
+    tronWebWithPrivateKey.setHeader({'TRON-PRO-API-KEY': TRONGRID_API_KEY});
 
     const contract = await tronWebWithPrivateKey.contract().at(USDT_CONTRACT);
     const amountInSun = Math.floor(amount * 1_000_000);
 
     console.log(`🔄 Sending ${amount} USDT to ${toAddress}...`);
     const result = await contract.transfer(toAddress, amountInSun).send();
-    // tronWeb contract.transfer returns object; check result.result or txid
+    
     if (result && (result.result === true || result.transaction || result.txid)) {
       console.log(`✅ USDT transfer submitted: ${amount} USDT to ${toAddress}`);
       return true;
@@ -324,11 +327,14 @@ async function sendTRX(fromPrivateKey, toAddress, amount) {
       return false;
     }
 
+    // Создаем чистый экземпляр TronWeb без лишних заголовков
     const tronWebWithPrivateKey = new TronWeb({
       fullHost: 'https://api.trongrid.io',
-      headers: { 'TRON-PRO-API-KEY': TRONGRID_API_KEY },
       privateKey: pk
     });
+
+    // Устанавливаем заголовок отдельно
+    tronWebWithPrivateKey.setHeader({'TRON-PRO-API-KEY': TRONGRID_API_KEY});
 
     const fromAddress = tronWebWithPrivateKey.address.fromPrivateKey(pk);
     const transaction = await tronWebWithPrivateKey.transactionBuilder.sendTrx(
@@ -350,6 +356,25 @@ async function sendTRX(fromPrivateKey, toAddress, amount) {
   } catch (error) {
     console.error('❌ TRX send error:', error && error.message ? error.message : error);
     return false;
+  }
+}
+
+// ========== getTRXBalance ==========
+async function getTRXBalance(address) {
+  try {
+    // Создаем чистый экземпляр для запроса баланса
+    const tronWebForBalance = new TronWeb({
+      fullHost: 'https://api.trongrid.io'
+    });
+    
+    // Устанавливаем заголовок отдельно
+    tronWebForBalance.setHeader({'TRON-PRO-API-KEY': TRONGRID_API_KEY});
+    
+    const balance = await tronWebForBalance.trx.getBalance(address);
+    return balance / 1_000_000;
+  } catch (error) {
+    console.error('❌ TRX balance error:', error && error.message ? error.message : error);
+    return 0;
   }
 }
 
@@ -413,17 +438,6 @@ async function autoCollectToMainWallet(wallet) {
   } catch (error) {
     console.error('❌ Auto-collection fatal error:', error && error.message ? error.message : error);
     return { success: false, reason: 'error', error: error && error.stack ? error.stack : String(error) };
-  }
-}
-
-// ========== getTRXBalance ==========
-async function getTRXBalance(address) {
-  try {
-    const balance = await tronWeb.trx.getBalance(address);
-    return balance / 1_000_000;
-  } catch (error) {
-    console.error('❌ TRX balance error:', error && error.message ? error.message : error);
-    return 0;
   }
 }
 
