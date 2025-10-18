@@ -59,9 +59,12 @@ function safeAmountFromValue(value) {
 // ========== TRON ФУНКЦИИ ==========
 async function getUSDTBalance(address) {
   try {
+    // ✅ ФИКС: конвертируем адрес в HEX формат
+    const hexAddress = tronWeb.address.toHex(address);
     const contract = await tronWeb.contract().at(USDT_CONTRACT);
-    const balance = await contract.balanceOf(address).call();
-    return parseInt(balance) / 1000000;
+    // вызов balanceOf обычно принимает hex
+    const balance = await contract.balanceOf(hexAddress).call();
+    return Number(balance) / 1_000_000;
   } catch (error) {
     console.error('❌ USDT balance error:', error);
     return 0;
@@ -602,12 +605,20 @@ app.get('/', (req, res) => {
 });
 
 // ========== АВТОПРОВЕРКА КАЖДЫЕ 2 МИНУТЫ ==========
-setInterval(() => {
-  console.log('🕒 AUTO-CHECK: Scanning for deposits...');
-  fetch(`http://localhost:${PORT}/check-deposits`)
-    .then(res => res.json())
-    .then(data => console.log('📊 Auto-check result:', data.message))
-    .catch(err => console.error('❌ Auto-check error:', err));
+// ✅ ФИКС: убрали fetch на localhost, вызываем функцию напрямую
+setInterval(async () => {
+  try {
+    console.log('🕒 AUTO-CHECK: Scanning for deposits (internal call)...');
+    // Создаем mock объекты req и res для вызова функции
+    const mockReq = {};
+    const mockRes = {
+      json: (data) => console.log('📊 Auto-check result:', data.message),
+      status: () => mockRes
+    };
+    await handleCheckDeposits(mockReq, mockRes);
+  } catch (err) {
+    console.error('❌ Auto-check internal error:', err);
+  }
 }, 120000);
 
 // ========== ЗАПУСК СЕРВЕРА ==========
