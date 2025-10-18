@@ -1,17 +1,21 @@
 {
-  "name": "bitfarm-wallet-system",
+  "name": "tron-wallet-server",
   "version": "1.0.0",
-  "description": "Automatic Tron wallet system for Bitfarm",
+  "description": "Tron Wallet System for Bitfarm",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "dev": "nodemon server.js"
   },
   "dependencies": {
     "express": "^4.18.2",
     "@supabase/supabase-js": "^2.38.0",
-    "tronweb": "^4.1.0"
+    "tronweb": "^5.5.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.1"
   },
   "engines": {
-    "node": ">=18.0.0"
+    "node": ">=16.0.0"
   }
 }
