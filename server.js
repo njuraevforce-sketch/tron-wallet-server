@@ -13,7 +13,7 @@ const PORT = process.env.PORT || 3000;
  */
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://bpsmizhrzgfbjqfpqkcz.supabase.co';
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || 'eyJhbGciOi...'; // replace in env
-const TRONGRID_API_KEY = process.env.TRONGRID_API_KEY || '7e6568cc-0967-4c09-9643-9a38b20aef4d';
+const TRONGRID_API_KEY = process.env.TRONGRID_API_KEY || '19e2411a-3c3e-479d-8c85-2abc716af397';
 
 // COMPANY wallets - move these to env in production
 const COMPANY = {
