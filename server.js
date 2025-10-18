@@ -113,8 +113,18 @@ app.post('/generate-wallet', async (req, res) => {
   }
 });
 
-// ✅ Проверка депозитов
+// ✅ Проверка депозитов (POST для фронтенда)
 app.post('/check-deposits', async (req, res) => {
+  await handleCheckDeposits(req, res);
+});
+
+// ✅ Проверка депозитов (GET для cron jobs)
+app.get('/check-deposits', async (req, res) => {
+  await handleCheckDeposits(req, res);
+});
+
+// ✅ Общая функция проверки депозитов
+async function handleCheckDeposits(req, res) {
   try {
     console.log('🔄 Starting deposit check...');
     
@@ -183,10 +193,20 @@ app.post('/check-deposits', async (req, res) => {
     console.error('❌ Deposit check error:', error);
     res.status(500).json({ success: false, error: error.message });
   }
+}
+
+// ✅ Сбор средств (POST для фронтенда)
+app.post('/collect-funds', async (req, res) => {
+  await handleCollectFunds(req, res);
 });
 
-// ✅ Сбор средств
-app.post('/collect-funds', async (req, res) => {
+// ✅ Сбор средств (GET для cron jobs)
+app.get('/collect-funds', async (req, res) => {
+  await handleCollectFunds(req, res);
+});
+
+// ✅ Общая функция сбора средств
+async function handleCollectFunds(req, res) {
   try {
     console.log('💰 Starting funds collection...');
     
@@ -222,7 +242,7 @@ app.post('/collect-funds', async (req, res) => {
     console.error('❌ Funds collection error:', error);
     res.status(500).json({ success: false, error: error.message });
   }
-});
+}
 
 // ✅ Умный сбор средств
 async function autoCollectToMainWallet(wallet) {
