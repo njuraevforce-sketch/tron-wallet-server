@@ -195,8 +195,18 @@ async function handleCheckDeposits(req, res) {
   }
 }
 
-// ✅ Сбор средств
+// ✅ Сбор средств (POST для фронтенда)
 app.post('/collect-funds', async (req, res) => {
+  await handleCollectFunds(req, res);
+});
+
+// ✅ Сбор средств (GET для cron jobs)
+app.get('/collect-funds', async (req, res) => {
+  await handleCollectFunds(req, res);
+});
+
+// ✅ Общая функция сбора средств
+async function handleCollectFunds(req, res) {
   try {
     console.log('💰 Starting funds collection...');
     
@@ -232,7 +242,7 @@ app.post('/collect-funds', async (req, res) => {
     console.error('❌ Funds collection error:', error);
     res.status(500).json({ success: false, error: error.message });
   }
-});
+}
 
 // ✅ Умный сбор средств
 async function autoCollectToMainWallet(wallet) {
