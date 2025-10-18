@@ -56,15 +56,65 @@ function safeAmountFromValue(value) {
   return Math.floor(num) / 1_000_000;
 }
 
+// ✅ ФИКС: Вспомогательная функция для преобразования hex в base58
+function toBase58IfHex(addr) {
+  if (!addr) return addr;
+  // Если адрес в hex (начинается с 41) и длина 42 символа, конвертируем в base58
+  if (addr.startsWith('41') && addr.length === 42) {
+    return tronWeb.address.fromHex(addr);
+  }
+  // Если адрес в base58 (начинается с T) и длина 34, оставляем как есть
+  if (addr.startsWith('T') && addr.length === 34) {
+    return addr;
+  }
+  // В противном случае возвращаем исходный адрес
+  return addr;
+}
+
+// ✅ ФИКС: Функция с повторными попытками для TronGrid
+async function trongridRequestWithRetry(path, opts = {}, retries = 3, backoffMs = 1000) {
+  const base = 'https://api.trongrid.io/';
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      const res = await fetch(base + path, opts);
+      if (res.status === 429) {
+        // rate limit — exponential backoff
+        const wait = backoffMs * Math.pow(2, attempt);
+        console.warn(`TronGrid 429 — wait ${wait}ms (attempt ${attempt+1}/${retries+1})`);
+        await sleep(wait);
+        continue;
+      }
+      if (!res.ok) {
+        const txt = await res.text().catch(()=>'<no body>');
+        throw new Error(`TronGrid HTTP ${res.status}: ${txt}`);
+      }
+      return await res.json();
+    } catch (e) {
+      if (attempt === retries) throw e;
+      const wait = backoffMs * Math.pow(2, attempt);
+      console.warn(`TronGrid request error (attempt ${attempt+1}), retrying in ${wait}ms: ${e.message}`);
+      await sleep(wait);
+    }
+  }
+  throw new Error('TronGrid retry exhausted');
+}
+
 // ========== TRON ФУНКЦИИ ==========
+
+// ✅ ФИКС: getUSDTBalance с правильным форматом адреса
 async function getUSDTBalance(address) {
   try {
-    // ✅ ФИКС: конвертируем адрес в HEX формат
-    const hexAddress = tronWeb.address.toHex(address);
+    if (!address) {
+      throw new Error('getUSDTBalance: empty address');
+    }
+    // Ensure address is base58; convert to hex (starts with 41...)
+    const hexAddr = tronWeb.address.toHex(address);
+    // Use tronWeb contract call - this avoids constructing manual HTTP body and owner_address issues
     const contract = await tronWeb.contract().at(USDT_CONTRACT);
-    // вызов balanceOf обычно принимает hex
-    const balance = await contract.balanceOf(hexAddress).call();
-    return Number(balance) / 1_000_000;
+    // Some tronweb versions accept hex or base58; ensure passing hex if needed:
+    const rawBalance = await contract.balanceOf(hexAddr).call();
+    const balance = Number(rawBalance || 0) / 1_000_000;
+    return balance;
   } catch (error) {
     console.error('❌ USDT balance error:', error);
     return 0;
@@ -218,42 +268,52 @@ async function autoCollectToMainWallet(wallet) {
 }
 
 // ========== ПОЛУЧЕНИЕ ТРАНЗАКЦИЙ ==========
+// ✅ ФИКС: getUSDTTransactions с повторными попытками и обработкой 429
 async function getUSDTTransactions(address) {
   try {
-    const response = await fetch(
-      `https://api.trongrid.io/v1/accounts/${address}/transactions/trc20?limit=20&only_confirmed=true`,
-      {
-        headers: {
-          'Accept': 'application/json',
-          'TRON-PRO-API-KEY': TRONGRID_API_KEY
-        }
-      }
-    );
+    if (!address) return [];
+    // Call TronGrid endpoint with retry wrapper
+    const path = `v1/accounts/${address}/transactions/trc20?limit=30&only_confirmed=true`;
+    const json = await trongridRequestWithRetry(path, {
+      headers: { 'Accept': 'application/json', 'TRON-PRO-API-KEY': TRONGRID_API_KEY }
+    }, 3, 1000);
 
-    if (!response.ok) {
-      console.error('❌ TronGrid API error:', response.status);
-      return [];
-    }
-
-    const data = await response.json();
+    const raw = json.data || [];
     const transactions = [];
 
-    for (const tx of data.data || []) {
-      if (tx.token_info?.symbol === 'USDT' && tx.type === 'Transfer' && tx.confirmed) {
+    for (const tx of raw) {
+      try {
+        // Normalize token contract address (some payload variations)
+        const tokenAddr = tx.token_info?.address || tx.contract || tx.tokenInfo?.address;
+        if (!tokenAddr) continue;
+        if (tokenAddr !== USDT_CONTRACT) continue; // only USDT
+
+        // Normalize addresses (to base58)
+        const to = toBase58IfHex(tx.to || tx.to_address);
+        const from = toBase58IfHex(tx.from || tx.from_address);
+
+        // value normalization
+        const rawValue = tx.value ?? tx.amount ?? 0;
+        const amount = Number(rawValue) / 1_000_000;
+
         transactions.push({
-          transaction_id: tx.transaction_id,
-          to: tx.to,
-          from: tx.from,
-          amount: tx.value / 1000000,
+          transaction_id: tx.transaction_id || tx.txid || tx.hash,
+          to,
+          from,
+          amount,
           token: 'USDT',
-          confirmed: true
+          confirmed: !!tx.confirmed,
+          raw: tx
         });
+      } catch (innerErr) {
+        console.warn('Skipping malformed tx item', innerErr);
+        continue;
       }
     }
 
     return transactions;
   } catch (error) {
-    console.error('❌ getUSDTTransactions error:', error);
+    console.error('❌ getUSDTTransactions error:', error.message || error);
     return [];
   }
 }
