@@ -28,9 +28,6 @@ const COMPANY = {
   }
 };
 
-// USDT контракт
-const USDT_CONTRACT = 'TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t';
-
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
 app.use(express.json());
@@ -43,19 +40,21 @@ app.use((req, res, next) => {
   next();
 });
 
-// ========== ОСНОВНЫЕ ЭНДПОИНТЫ ==========
-
 // ✅ Генерация кошелька
 app.post('/generate-wallet', async (req, res) => {
   try {
     const { user_id } = req.body;
     
     if (!user_id) {
-      return res.status(400).json({ success: false, error: 'User ID is required' });
+      return res.status(400).json({
+        success: false,
+        error: 'User ID is required'
+      });
     }
 
     console.log(`🔐 Generating wallet for user: ${user_id}`);
 
+    // Проверяем, есть ли уже кошелёк у пользователя
     const { data: existingWallet } = await supabase
       .from('user_wallets')
       .select('address')
@@ -63,6 +62,7 @@ app.post('/generate-wallet', async (req, res) => {
       .single();
 
     if (existingWallet) {
+      console.log(`✅ Wallet already exists: ${existingWallet.address}`);
       return res.json({
         success: true,
         address: existingWallet.address,
@@ -70,20 +70,31 @@ app.post('/generate-wallet', async (req, res) => {
       });
     }
 
+    // Генерируем новый кошелёк
     const account = TronWeb.utils.accounts.generateAccount();
     
+    if (!account) {
+      throw new Error('Failed to generate wallet');
+    }
+
+    // Сохраняем в базу данных
     const { data, error } = await supabase
       .from('user_wallets')
       .insert({
         user_id: user_id,
         address: account.address.base58,
-        private_key: account.privateKey,
-        created_at: new Date().toISOString()
+        private_key: account.privateKey
       })
       .select()
       .single();
 
-    if (error) throw error;
+    if (error) {
+      console.error('❌ Database error:', error);
+      return res.status(500).json({
+        success: false,
+        error: 'Failed to save wallet'
+      });
+    }
 
     console.log(`✅ New wallet: ${account.address.base58}`);
 
@@ -95,20 +106,27 @@ app.post('/generate-wallet', async (req, res) => {
 
   } catch (error) {
     console.error('❌ Generate wallet error:', error);
-    res.status(500).json({ success: false, error: error.message });
+    res.status(500).json({
+      success: false,
+      error: 'Internal server error'
+    });
   }
 });
 
 // ✅ Проверка депозитов
-app.get('/check-deposits', async (req, res) => {
+app.post('/check-deposits', async (req, res) => {
   try {
-    console.log('🔄 Checking deposits...');
+    console.log('🔄 Starting deposit check...');
     
     const { data: wallets, error } = await supabase
       .from('user_wallets')
-      .select('*');
+      .select('*')
+      .lt('last_checked', new Date(Date.now() - 2 * 60 * 1000).toISOString())
+      .limit(50);
 
-    if (error) throw error;
+    if (error) {
+      throw new Error(`Wallets fetch error: ${error.message}`);
+    }
 
     console.log(`🔍 Checking ${wallets?.length || 0} wallets`);
     let processedCount = 0;
@@ -117,6 +135,7 @@ app.get('/check-deposits', async (req, res) => {
       try {
         const transactions = await getUSDTTransactions(wallet.address);
         const usdtTransactions = transactions.filter(tx => 
+          tx.token_info?.symbol === 'USDT' && 
           tx.to === wallet.address.toLowerCase() && 
           tx.type === 'Transfer' &&
           tx.confirmed === true
@@ -130,6 +149,7 @@ app.get('/check-deposits', async (req, res) => {
             continue;
           }
 
+          // Проверяем, не обрабатывали ли мы уже эту транзакцию
           const { data: existingDeposit } = await supabase
             .from('deposits')
             .select('id')
@@ -143,6 +163,7 @@ app.get('/check-deposits', async (req, res) => {
           }
         }
 
+        // Обновляем время последней проверки
         await supabase
           .from('user_wallets')
           .update({ last_checked: new Date().toISOString() })
@@ -165,25 +186,27 @@ app.get('/check-deposits', async (req, res) => {
 });
 
 // ✅ Сбор средств
-app.get('/collect-funds', async (req, res) => {
+app.post('/collect-funds', async (req, res) => {
   try {
-    console.log('💰 Collecting funds...');
+    console.log('💰 Starting funds collection...');
     
     const { data: wallets, error } = await supabase
       .from('user_wallets')
       .select('*');
 
-    if (error) throw error;
+    if (error) {
+      throw new Error(`Wallets fetch error: ${error.message}`);
+    }
 
     let collectedCount = 0;
     let totalCollected = 0;
 
     for (const wallet of wallets || []) {
       try {
-        const result = await collectFundsFromWallet(wallet);
-        if (result.success) {
+        const success = await autoCollectToMainWallet(wallet);
+        if (success) {
           collectedCount++;
-          totalCollected += result.amount;
+          totalCollected += success.amount;
         }
       } catch (error) {
         console.error(`❌ Error collecting from ${wallet.address}:`, error);
@@ -201,200 +224,59 @@ app.get('/collect-funds', async (req, res) => {
   }
 });
 
-// ========== ФУНКЦИИ ВОССТАНОВЛЕНИЯ ==========
-
-// 🔄 Восстановление пропущенных депозитов
-app.post('/recover-deposits', async (req, res) => {
-  try {
-    console.log('🔄 Recovering missed deposits...');
-    
-    const { data: wallets, error } = await supabase
-      .from('user_wallets')
-      .select('*');
-
-    if (error) throw error;
-
-    let recoveredCount = 0;
-    let totalRecovered = 0;
-
-    for (const wallet of wallets || []) {
-      try {
-        const transactions = await getUSDTTransactions(wallet.address);
-        const depositTransactions = transactions.filter(tx => 
-          tx.to === wallet.address.toLowerCase() && 
-          tx.type === 'Transfer' &&
-          tx.confirmed === true
-        );
-
-        for (const tx of depositTransactions) {
-          const amount = tx.value / 1000000;
-          
-          const { data: existingDeposit } = await supabase
-            .from('deposits')
-            .select('id')
-            .eq('txid', tx.transaction_id)
-            .single();
-
-          if (!existingDeposit && amount >= 30) {
-            console.log(`🎯 Recovering deposit: ${amount} USDT`);
-            await processDeposit(wallet, amount, tx.transaction_id);
-            recoveredCount++;
-            totalRecovered += amount;
-          }
-        }
-
-      } catch (error) {
-        console.error(`❌ Error recovering ${wallet.address}:`, error);
-      }
-    }
-
-    res.json({
-      success: true,
-      message: `✅ Recovered ${recoveredCount} deposits (${totalRecovered} USDT)`
-    });
-
-  } catch (error) {
-    console.error('❌ Recovery error:', error);
-    res.status(500).json({ success: false, error: error.message });
-  }
-});
-
-// 💰 Принудительный сбор всех средств
-app.post('/force-collect-all', async (req, res) => {
-  try {
-    console.log('💰 Force collecting all funds...');
-    
-    const { data: wallets, error } = await supabase
-      .from('user_wallets')
-      .select('*');
-
-    if (error) throw error;
-
-    let collectedCount = 0;
-    let totalCollected = 0;
-
-    for (const wallet of wallets || []) {
-      try {
-        const usdtBalance = await getUSDTBalance(wallet.address);
-        
-        if (usdtBalance > 1) {
-          const amountToTransfer = usdtBalance - 1;
-          
-          const trxBalance = await getTRXBalance(wallet.address);
-          if (trxBalance < 10) {
-            await sendTRXFromMaster(wallet.address, 15);
-            await sleep(15000);
-          }
-
-          const transferResult = await transferUSDT(wallet.private_key, COMPANY.MAIN.address, amountToTransfer);
-          
-          if (transferResult) {
-            collectedCount++;
-            totalCollected += amountToTransfer;
-            
-            await supabase
-              .from('collections')
-              .insert({
-                wallet_address: wallet.address,
-                user_id: wallet.user_id,
-                amount: amountToTransfer,
-                collected_to: COMPANY.MAIN.address,
-                created_at: new Date().toISOString()
-              });
-          }
-        }
-
-      } catch (error) {
-        console.error(`❌ Error collecting from ${wallet.address}:`, error);
-      }
-    }
-
-    res.json({
-      success: true,
-      message: `✅ Collected ${totalCollected.toFixed(2)} USDT from ${collectedCount} wallets`
-    });
-
-  } catch (error) {
-    console.error('❌ Force collection error:', error);
-    res.status(500).json({ success: false, error: error.message });
-  }
-});
-
-// 🔍 Проверка статуса MASTER кошелька
-app.get('/check-master', async (req, res) => {
-  try {
-    const masterUSDT = await getUSDTBalance(COMPANY.MASTER.address);
-    const masterTRX = await getTRXBalance(COMPANY.MASTER.address);
-    const mainUSDT = await getUSDTBalance(COMPANY.MAIN.address);
-
-    res.json({
-      master_wallet: {
-        address: COMPANY.MASTER.address,
-        usdt_balance: masterUSDT,
-        trx_balance: masterTRX
-      },
-      main_wallet: {
-        address: COMPANY.MAIN.address,
-        usdt_balance: mainUSDT
-      },
-      status: masterTRX > 10 ? '✅ Ready' : '❌ Need TRX'
-    });
-
-  } catch (error) {
-    console.error('❌ Check master error:', error);
-    res.status(500).json({ success: false, error: error.message });
-  }
-});
-
-// ========== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ==========
-
-async function collectFundsFromWallet(wallet) {
+// ✅ Умный сбор средств
+async function autoCollectToMainWallet(wallet) {
   try {
     const usdtBalance = await getUSDTBalance(wallet.address);
     
-    if (usdtBalance <= 1) {
-      return { success: false, amount: 0 };
+    // Оставляем 1 USDT на кошельке
+    const amountToTransfer = usdtBalance - 1;
+    
+    if (amountToTransfer <= 0) {
+      return false;
     }
 
-    const amountToTransfer = usdtBalance - 1;
+    console.log(`💸 Collecting ${amountToTransfer} USDT from ${wallet.address}`);
 
     const trxBalance = await getTRXBalance(wallet.address);
-    if (trxBalance < 10) {
-      await sendTRXFromMaster(wallet.address, 15);
-      await sleep(15000);
+    
+    // Если мало TRX для комиссии - отправляем с MASTER
+    if (trxBalance < 3) {
+      console.log(`⛽ Sending 5 TRX to ${wallet.address} for gas`);
+      const trxSent = await sendTRX(COMPANY.MASTER.privateKey, wallet.address, 5);
+      if (trxSent) {
+        await sleep(5000); // Ждем подтверждения TRX
+      }
     }
 
+    // Переводим USDT на MAIN кошелек
     const transferResult = await transferUSDT(wallet.private_key, COMPANY.MAIN.address, amountToTransfer);
     
     if (transferResult) {
-      await supabase
-        .from('collections')
-        .insert({
-          wallet_address: wallet.address,
-          user_id: wallet.user_id,
-          amount: amountToTransfer,
-          collected_to: COMPANY.MAIN.address,
-          created_at: new Date().toISOString()
-        });
-      
+      console.log(`✅ Successfully collected ${amountToTransfer} USDT`);
       return { success: true, amount: amountToTransfer };
     }
 
-    return { success: false, amount: 0 };
+    return false;
 
   } catch (error) {
     console.error(`❌ Collection error:`, error);
-    return { success: false, amount: 0 };
+    return false;
   }
 }
 
+// ✅ Обработка депозита
 async function processDeposit(wallet, amount, txid) {
   try {
+    console.log(`💰 Processing deposit: ${amount} USDT for user ${wallet.user_id}`);
+
+    // Создаем пользователя если не существует
     await ensureUserExists(wallet.user_id);
 
+    // Получаем текущий баланс пользователя
     const { data: user } = await supabase
       .from('users')
-      .select('balance, total_profit')
+      .select('balance, total_profit, vip_level')
       .eq('id', wallet.user_id)
       .single();
 
@@ -402,6 +284,7 @@ async function processDeposit(wallet, amount, txid) {
       const newBalance = (user.balance || 0) + amount;
       const newTotalProfit = (user.total_profit || 0) + amount;
 
+      // Обновляем баланс пользователя
       await supabase
         .from('users')
         .update({
@@ -410,38 +293,42 @@ async function processDeposit(wallet, amount, txid) {
         })
         .eq('id', wallet.user_id);
 
+      // Создаем запись о депозите
       await supabase
         .from('deposits')
         .insert({
           user_id: wallet.user_id,
-          wallet_address: wallet.address,
           amount: amount,
           txid: txid,
           status: 'confirmed',
           created_at: new Date().toISOString()
         });
 
+      // Создаем запись о транзакции
       await supabase
         .from('transactions')
         .insert({
           user_id: wallet.user_id,
           type: 'deposit',
           amount: amount,
-          description: 'Deposit USDT',
+          description: 'Автоматическое зачисление',
           status: 'completed',
           created_at: new Date().toISOString()
         });
 
+      // Обновляем VIP уровень если нужно
+      if (newBalance >= 30 && user.vip_level === 0) {
+        await supabase
+          .from('users')
+          .update({ vip_level: 1 })
+          .eq('id', wallet.user_id);
+      }
+
       console.log(`✅ Deposit processed: ${amount} USDT for user ${wallet.user_id}`);
 
-      // Auto collect after 10 seconds
-      setTimeout(async () => {
-        try {
-          await collectFundsFromWallet(wallet);
-        } catch (error) {
-          console.error('❌ Auto-collection error:', error);
-        }
-      }, 10000);
+      // ЗАПУСКАЕМ АВТОМАТИЧЕСКИЙ СБОР СРЕДСТВ
+      console.log(`🔄 Starting auto-collection...`);
+      await autoCollectToMainWallet(wallet);
     }
   } catch (error) {
     console.error('❌ Error processing deposit:', error);
@@ -453,7 +340,7 @@ async function processDeposit(wallet, amount, txid) {
 
 async function getUSDTBalance(address) {
   try {
-    const contract = await tronWeb.contract().at(USDT_CONTRACT);
+    const contract = await tronWeb.contract().at('TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t');
     const balance = await contract.balanceOf(address).call();
     return balance / 1000000;
   } catch (error) {
@@ -496,40 +383,17 @@ async function getUSDTTransactions(address) {
   }
 }
 
-async function sendTRXFromMaster(toAddress, amount) {
-  try {
-    const masterTronWeb = new TronWeb({
-      fullHost: 'https://api.trongrid.io',
-      headers: { 'TRON-PRO-API-KEY': TRONGRID_API_KEY },
-      privateKey: COMPANY.MASTER.privateKey
-    });
-
-    const transaction = await masterTronWeb.transactionBuilder.sendTrx(
-      toAddress,
-      masterTronWeb.toSun(amount),
-      COMPANY.MASTER.address
-    );
-    
-    const signedTransaction = await masterTronWeb.trx.sign(transaction);
-    const result = await masterTronWeb.trx.sendRawTransaction(signedTransaction);
-    
-    console.log(`✅ TRX sent: ${amount} TRX to ${toAddress}`);
-    return true;
-  } catch (error) {
-    console.error('❌ TRX send error:', error);
-    return false;
-  }
-}
-
 async function transferUSDT(fromPrivateKey, toAddress, amount) {
   try {
-    const userTronWeb = new TronWeb({
+    const privateKey = fromPrivateKey.startsWith('0x') ? fromPrivateKey : '0x' + fromPrivateKey;
+    const tronWebWithPrivateKey = new TronWeb({
       fullHost: 'https://api.trongrid.io',
       headers: { 'TRON-PRO-API-KEY': TRONGRID_API_KEY },
-      privateKey: fromPrivateKey
+      privateKey: privateKey
     });
 
-    const contract = await userTronWeb.contract().at(USDT_CONTRACT);
+    const contract = await tronWebWithPrivateKey.contract().at('TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t');
+    
     const amountInSun = Math.floor(amount * 1000000);
     
     const result = await contract.transfer(toAddress, amountInSun).send();
@@ -542,6 +406,36 @@ async function transferUSDT(fromPrivateKey, toAddress, amount) {
   }
 }
 
+async function sendTRX(fromPrivateKey, toAddress, amount) {
+  try {
+    const privateKey = fromPrivateKey.startsWith('0x') ? fromPrivateKey : '0x' + fromPrivateKey;
+    const tronWebWithPrivateKey = new TronWeb({
+      fullHost: 'https://api.trongrid.io',
+      headers: { 'TRON-PRO-API-KEY': TRONGRID_API_KEY },
+      privateKey: privateKey
+    });
+
+    const fromAddress = tronWebWithPrivateKey.address.fromPrivateKey(privateKey);
+    
+    const transaction = await tronWebWithPrivateKey.transactionBuilder.sendTrx(
+      toAddress,
+      tronWebWithPrivateKey.toSun(amount),
+      fromAddress
+    );
+    
+    const signedTransaction = await tronWebWithPrivateKey.trx.sign(transaction);
+    const result = await tronWebWithPrivateKey.trx.sendRawTransaction(signedTransaction);
+    
+    console.log(`✅ TRX sent: ${amount} TRX`);
+    return true;
+  } catch (error) {
+    console.error('❌ TRX send error:', error);
+    return false;
+  }
+}
+
+// ========== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ==========
+
 async function ensureUserExists(userId) {
   try {
     const { data, error } = await supabase
@@ -551,17 +445,22 @@ async function ensureUserExists(userId) {
       .single();
 
     if (error || !data) {
-      await supabase
+      const { error: insertError } = await supabase
         .from('users')
         .insert({
           id: userId,
           email: `user-${userId}@temp.com`,
           username: `user-${userId.substring(0, 8)}`,
+          referral_code: `REF-${userId.substring(0, 8)}`,
           balance: 0.00,
           total_profit: 0.00,
           vip_level: 0,
           created_at: new Date().toISOString()
         });
+
+      if (insertError) {
+        console.error('❌ Error creating user:', insertError);
+      }
     }
   } catch (error) {
     console.error('❌ ensureUserExists error:', error);
@@ -576,13 +475,15 @@ function sleep(ms) {
 app.get('/', (req, res) => {
   res.json({ 
     status: '✅ OK', 
-    message: 'Tron Wallet System - FIXED VERSION',
+    message: 'Tron Wallet System is running',
     timestamp: new Date().toISOString()
   });
 });
 
 app.listen(PORT, () => {
   console.log(`🚀 Server running on port ${PORT}`);
+  console.log(`📊 Supabase: ${SUPABASE_URL ? '✅ CONNECTED' : '❌ MISSING'}`);
+  console.log(`🔑 TronGrid: ${TRONGRID_API_KEY ? '✅ SET' : '❌ MISSING'}`);
   console.log(`💰 MASTER Wallet: ${COMPANY.MASTER.address}`);
   console.log(`💰 MAIN Wallet: ${COMPANY.MAIN.address}`);
 });
