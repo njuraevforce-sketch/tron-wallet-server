@@ -113,8 +113,18 @@ app.post('/generate-wallet', async (req, res) => {
   }
 });
 
-// ✅ Проверка депозитов
+// ✅ Проверка депозитов (POST для фронтенда)
 app.post('/check-deposits', async (req, res) => {
+  await handleCheckDeposits(req, res);
+});
+
+// ✅ Проверка депозитов (GET для cron jobs)
+app.get('/check-deposits', async (req, res) => {
+  await handleCheckDeposits(req, res);
+});
+
+// ✅ Общая функция проверки депозитов
+async function handleCheckDeposits(req, res) {
   try {
     console.log('🔄 Starting deposit check...');
     
@@ -183,7 +193,7 @@ app.post('/check-deposits', async (req, res) => {
     console.error('❌ Deposit check error:', error);
     res.status(500).json({ success: false, error: error.message });
   }
-});
+}
 
 // ✅ Сбор средств
 app.post('/collect-funds', async (req, res) => {
