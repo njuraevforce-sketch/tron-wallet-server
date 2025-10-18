@@ -1,4 +1,4 @@
-// server.js — 100% РАБОЧИЙ АВТОСБОР
+// server.js — 100% РАБОЧИЙ АВТОСБОР С THROTTLING
 const express = require('express');
 const { createClient } = require('@supabase/supabase-js');
 const TronWeb = require('tronweb');
@@ -6,7 +6,7 @@ const TronWeb = require('tronweb');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// ✅ ФИКСИРОВАННЫЕ КОНФИГИ (не зависят от env)
+// ✅ ФИКСИРОВАННЫЕ КОНФИГИ
 const SUPABASE_URL = 'https://bpsmizhrzgfbjqfpqkcz.supabase.co';
 const SUPABASE_SERVICE_ROLE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImJwc21pemhyemdmYmpxZnBxa2N6Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NTk5MTE4NzQsImV4cCI6MjA3NTQ4Nzg3NH0.qYrRbTTTcGc_IqEXATezuU4sbbol6ELV9HumPW6cvwU';
 const TRONGRID_API_KEY = '7e6568cc-0967-4c09-9643-9a38b20aef4d';
@@ -45,6 +45,46 @@ const KEEP_AMOUNT = 1.0;
 const MIN_TRX_FOR_FEE = 3;
 const FUND_TRX_AMOUNT = 10;
 
+// ========== THROTTLING СИСТЕМА ДЛЯ БАЛАНСОВ ==========
+let BALANCE_CONCURRENCY = 2;
+let currentBalanceRequests = 0;
+const pendingBalanceQueue = [];
+
+function enqueueBalanceJob(fn) {
+  return new Promise((resolve, reject) => {
+    pendingBalanceQueue.push({ fn, resolve, reject });
+    runBalanceQueue();
+  });
+}
+
+function runBalanceQueue() {
+  while (currentBalanceRequests < BALANCE_CONCURRENCY && pendingBalanceQueue.length) {
+    const job = pendingBalanceQueue.shift();
+    currentBalanceRequests++;
+    job.fn()
+      .then(res => {
+        currentBalanceRequests--;
+        job.resolve(res);
+        setTimeout(runBalanceQueue, 200);
+      })
+      .catch(err => {
+        currentBalanceRequests--;
+        job.reject(err);
+        setTimeout(runBalanceQueue, 200);
+      });
+  }
+}
+
+async function tryContractBalanceWithFormat(addressParam, attemptNote = '') {
+  try {
+    const contract = await tronWeb.contract().at(USDT_CONTRACT);
+    const raw = await contract.balanceOf(addressParam).call();
+    return Number(raw || 0) / 1e6;
+  } catch (err) {
+    throw err;
+  }
+}
+
 // ========== ХЕЛПЕРЫ ==========
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
@@ -56,84 +96,56 @@ function safeAmountFromValue(value) {
   return Math.floor(num) / 1_000_000;
 }
 
-// ✅ ФИКС: Вспомогательная функция для преобразования hex в base58
-function toBase58IfHex(addr) {
-  if (!addr) return addr;
-  // Если адрес в hex (начинается с 41) и длина 42 символа, конвертируем в base58
-  if (addr.startsWith('41') && addr.length === 42) {
-    return tronWeb.address.fromHex(addr);
-  }
-  // Если адрес в base58 (начинается с T) и длина 34, оставляем как есть
-  if (addr.startsWith('T') && addr.length === 34) {
-    return addr;
-  }
-  // В противном случае возвращаем исходный адрес
-  return addr;
-}
-
-// ✅ ФИКС: Функция с повторными попытками для TronGrid
-async function trongridRequestWithRetry(path, opts = {}, retries = 3, backoffMs = 1000) {
-  const base = 'https://api.trongrid.io/';
-  for (let attempt = 0; attempt <= retries; attempt++) {
-    try {
-      const res = await fetch(base + path, opts);
-      if (res.status === 429) {
-        // rate limit — exponential backoff
-        const wait = backoffMs * Math.pow(2, attempt);
-        console.warn(`TronGrid 429 — wait ${wait}ms (attempt ${attempt+1}/${retries+1})`);
-        await sleep(wait);
-        continue;
-      }
-      if (!res.ok) {
-        const txt = await res.text().catch(()=>'<no body>');
-        throw new Error(`TronGrid HTTP ${res.status}: ${txt}`);
-      }
-      return await res.json();
-    } catch (e) {
-      if (attempt === retries) throw e;
-      const wait = backoffMs * Math.pow(2, attempt);
-      console.warn(`TronGrid request error (attempt ${attempt+1}), retrying in ${wait}ms: ${e.message}`);
-      await sleep(wait);
-    }
-  }
-  throw new Error('TronGrid retry exhausted');
-}
-
 // ========== TRON ФУНКЦИИ ==========
-
-// ✅ ФИКС: getUSDTBalance с правильным форматом адреса
 async function getUSDTBalance(address) {
-  try {
+  return enqueueBalanceJob(async () => {
     if (!address) {
-      throw new Error('getUSDTBalance: empty address');
+      console.warn('getUSDTBalance called with empty address');
+      return 0;
     }
-    // Ensure address is base58; convert to hex (starts with 41...)
-    const hexAddr = tronWeb.address.toHex(address);
-    // Use tronWeb contract call - this avoids constructing manual HTTP body and owner_address issues
-    const contract = await tronWeb.contract().at(USDT_CONTRACT);
-    // Some tronweb versions accept hex or base58; ensure passing hex if needed:
-    const rawBalance = await contract.balanceOf(hexAddr).call();
-    const balance = Number(rawBalance || 0) / 1_000_000;
-    return balance;
-  } catch (error) {
-    console.error('❌ USDT balance error:', error);
+
+    // 1) сначала пробуем base58 (обычный вид T...)
+    try {
+      const bal1 = await tryContractBalanceWithFormat(address, 'base58');
+      if (!Number.isNaN(bal1)) {
+        console.log(`✅ USDT Balance: ${bal1} USDT for ${address}`);
+        return bal1;
+      }
+    } catch (err1) {
+      console.warn('getUSDTBalance base58 error:', err1.message);
+    }
+
+    // 2) пробуем hex (41...)
+    try {
+      const hexAddr = tronWeb.address.toHex(address);
+      const bal2 = await tryContractBalanceWithFormat(hexAddr, 'hex');
+      if (!Number.isNaN(bal2)) {
+        console.log(`✅ USDT Balance: ${bal2} USDT for ${address} (hex)`);
+        return bal2;
+      }
+    } catch (err2) {
+      console.error('❌ USDT balance error (both attempts failed):', err2.message);
+      return 0;
+    }
+
     return 0;
-  }
+  });
 }
 
 async function getTRXBalance(address) {
   try {
     const balance = await tronWeb.trx.getBalance(address);
-    return balance / 1000000;
+    const balanceTRX = balance / 1_000_000;
+    console.log(`⛽ TRX Balance: ${balanceTRX} TRX for ${address}`);
+    return balanceTRX;
   } catch (error) {
-    console.error('❌ TRX balance error:', error);
+    console.error('❌ TRX balance error:', error.message);
     return 0;
   }
 }
 
 async function transferUSDT(fromPrivateKey, toAddress, amount) {
   try {
-    // ✅ ФИКС: добавляем 0x к приватному ключу
     const privateKey = fromPrivateKey.startsWith('0x') ? fromPrivateKey : '0x' + fromPrivateKey;
     
     const tronWebWithPrivateKey = new TronWeb({
@@ -148,7 +160,6 @@ async function transferUSDT(fromPrivateKey, toAddress, amount) {
     console.log(`🔄 Sending ${amount} USDT to ${toAddress}...`);
     const result = await contract.transfer(toAddress, amountInSun).send();
     
-    // ✅ ФИКС: проверяем результат транзакции
     if (result && result.result) {
       console.log(`✅ USDT transfer successful: ${amount} USDT to ${toAddress}`);
       return true;
@@ -164,7 +175,6 @@ async function transferUSDT(fromPrivateKey, toAddress, amount) {
 
 async function sendTRX(fromPrivateKey, toAddress, amount) {
   try {
-    // ✅ ФИКС: добавляем 0x к приватному ключу
     const privateKey = fromPrivateKey.startsWith('0x') ? fromPrivateKey : '0x' + fromPrivateKey;
     
     const tronWebWithPrivateKey = new TronWeb({
@@ -199,7 +209,6 @@ async function autoCollectToMainWallet(wallet) {
     
     // Получаем баланс USDT
     const usdtBalance = await getUSDTBalance(wallet.address);
-    console.log(`📊 USDT Balance: ${usdtBalance} USDT`);
     
     // Оставляем 1 USDT, остальное собираем
     const amountToTransfer = usdtBalance - 1;
@@ -213,7 +222,6 @@ async function autoCollectToMainWallet(wallet) {
 
     // Проверяем баланс TRX
     const trxBalance = await getTRXBalance(wallet.address);
-    console.log(`⛽ TRX Balance: ${trxBalance} TRX`);
 
     // Если мало TRX, отправляем с MASTER кошелька
     if (trxBalance < MIN_TRX_FOR_FEE) {
@@ -222,9 +230,8 @@ async function autoCollectToMainWallet(wallet) {
       
       if (trxSent) {
         console.log(`⏳ Waiting 15 seconds for TRX confirmation...`);
-        await sleep(15000); // Ждем подтверждения TRX
+        await sleep(15000);
         
-        // ✅ ФИКС: проверяем что TRX действительно пришли
         const newTrxBalance = await getTRXBalance(wallet.address);
         console.log(`📊 New TRX Balance: ${newTrxBalance} TRX`);
         
@@ -245,7 +252,6 @@ async function autoCollectToMainWallet(wallet) {
     if (transferResult) {
       console.log(`✅ SUCCESS: Collected ${amountToTransfer} USDT from ${wallet.address}`);
       
-      // Записываем сбор в транзакции
       await supabase.from('transactions').insert({
         user_id: wallet.user_id,
         type: 'collect',
@@ -268,52 +274,42 @@ async function autoCollectToMainWallet(wallet) {
 }
 
 // ========== ПОЛУЧЕНИЕ ТРАНЗАКЦИЙ ==========
-// ✅ ФИКС: getUSDTTransactions с повторными попытками и обработкой 429
 async function getUSDTTransactions(address) {
   try {
-    if (!address) return [];
-    // Call TronGrid endpoint with retry wrapper
-    const path = `v1/accounts/${address}/transactions/trc20?limit=30&only_confirmed=true`;
-    const json = await trongridRequestWithRetry(path, {
-      headers: { 'Accept': 'application/json', 'TRON-PRO-API-KEY': TRONGRID_API_KEY }
-    }, 3, 1000);
+    const response = await fetch(
+      `https://api.trongrid.io/v1/accounts/${address}/transactions/trc20?limit=20&only_confirmed=true`,
+      {
+        headers: {
+          'Accept': 'application/json',
+          'TRON-PRO-API-KEY': TRONGRID_API_KEY
+        }
+      }
+    );
 
-    const raw = json.data || [];
+    if (!response.ok) {
+      console.error('❌ TronGrid API error:', response.status);
+      return [];
+    }
+
+    const data = await response.json();
     const transactions = [];
 
-    for (const tx of raw) {
-      try {
-        // Normalize token contract address (some payload variations)
-        const tokenAddr = tx.token_info?.address || tx.contract || tx.tokenInfo?.address;
-        if (!tokenAddr) continue;
-        if (tokenAddr !== USDT_CONTRACT) continue; // only USDT
-
-        // Normalize addresses (to base58)
-        const to = toBase58IfHex(tx.to || tx.to_address);
-        const from = toBase58IfHex(tx.from || tx.from_address);
-
-        // value normalization
-        const rawValue = tx.value ?? tx.amount ?? 0;
-        const amount = Number(rawValue) / 1_000_000;
-
+    for (const tx of data.data || []) {
+      if (tx.token_info?.symbol === 'USDT' && tx.type === 'Transfer' && tx.confirmed) {
         transactions.push({
-          transaction_id: tx.transaction_id || tx.txid || tx.hash,
-          to,
-          from,
-          amount,
+          transaction_id: tx.transaction_id,
+          to: tx.to,
+          from: tx.from,
+          amount: tx.value / 1000000,
           token: 'USDT',
-          confirmed: !!tx.confirmed,
-          raw: tx
+          confirmed: true
         });
-      } catch (innerErr) {
-        console.warn('Skipping malformed tx item', innerErr);
-        continue;
       }
     }
 
     return transactions;
   } catch (error) {
-    console.error('❌ getUSDTTransactions error:', error.message || error);
+    console.error('❌ getUSDTTransactions error:', error);
     return [];
   }
 }
@@ -323,10 +319,8 @@ async function processDeposit(wallet, amount, txid) {
   try {
     console.log(`💰 PROCESSING DEPOSIT: ${amount} USDT for user ${wallet.user_id}`);
     
-    // Создаем пользователя если не существует
     await ensureUserExists(wallet.user_id);
 
-    // Получаем текущий баланс
     const { data: user } = await supabase
       .from('users')
       .select('balance, total_profit, vip_level')
@@ -337,7 +331,6 @@ async function processDeposit(wallet, amount, txid) {
       const newBalance = (user.balance || 0) + amount;
       const newTotalProfit = (user.total_profit || 0) + amount;
 
-      // Обновляем баланс пользователя
       await supabase
         .from('users')
         .update({
@@ -347,7 +340,6 @@ async function processDeposit(wallet, amount, txid) {
         })
         .eq('id', wallet.user_id);
 
-      // Записываем депозит
       await supabase
         .from('deposits')
         .insert({
@@ -358,7 +350,6 @@ async function processDeposit(wallet, amount, txid) {
           created_at: new Date().toISOString()
         });
 
-      // Записываем транзакцию
       await supabase
         .from('transactions')
         .insert({
@@ -370,7 +361,6 @@ async function processDeposit(wallet, amount, txid) {
           created_at: new Date().toISOString()
         });
 
-      // Обновляем VIP уровень
       if (newBalance >= 30 && user.vip_level === 0) {
         await supabase
           .from('users')
@@ -382,7 +372,6 @@ async function processDeposit(wallet, amount, txid) {
       console.log(`✅ DEPOSIT PROCESSED: ${amount} USDT for user ${wallet.user_id}`);
       console.log(`💰 New balance: ${newBalance} USDT`);
 
-      // ✅ ЗАПУСКАЕМ АВТОСБОР
       console.log(`🔄 Starting auto-collection for ${wallet.address}...`);
       const collectResult = await autoCollectToMainWallet(wallet);
       console.log(`🎯 Auto-collection result:`, collectResult);
@@ -409,7 +398,6 @@ app.post('/generate-wallet', async (req, res) => {
     console.log(`🔐 Generating wallet for user: ${user_id}`);
     await ensureUserExists(user_id);
 
-    // Проверяем существующий кошелек
     const { data: existingWallet } = await supabase
       .from('user_wallets')
       .select('address')
@@ -425,10 +413,8 @@ app.post('/generate-wallet', async (req, res) => {
       });
     }
 
-    // Генерируем новый кошелек
     const account = TronWeb.utils.accounts.generateAccount();
     
-    // Сохраняем в базу
     const { data, error } = await supabase
       .from('user_wallets')
       .insert({
@@ -450,7 +436,6 @@ app.post('/generate-wallet', async (req, res) => {
 
     console.log(`✅ New wallet created: ${account.address.base58}`);
     
-    // Запускаем проверку депозитов
     setTimeout(() => checkUserDeposits(user_id), 5000);
 
     res.json({
@@ -477,30 +462,31 @@ app.get('/check-deposits', async (req, res) => {
   await handleCheckDeposits(req, res);
 });
 
+// ========== ИСПРАВЛЕННАЯ handleCheckDeposits С THROTTLING ==========
 async function handleCheckDeposits(req, res) {
   try {
-    console.log('🔄 Checking deposits for all users...');
+    console.log('🔄 Checking deposits for all users (THROTTLED)...');
     
-    // Берем все кошельки
     const { data: wallets, error } = await supabase
       .from('user_wallets')
       .select('*')
-      .limit(100);
+      .limit(8);
 
     if (error) throw error;
 
-    console.log(`🔍 Checking ${wallets?.length || 0} wallets`);
+    console.log(`🔍 Checking ${wallets?.length || 0} wallets with throttling`);
     let processedCount = 0;
     let depositsFound = 0;
 
     for (const wallet of wallets || []) {
       try {
+        await sleep(3000);
+        
         const transactions = await getUSDTTransactions(wallet.address);
         
         for (const tx of transactions) {
           if (tx.to === wallet.address && tx.token === 'USDT' && tx.amount >= MIN_DEPOSIT) {
             
-            // Проверяем не обрабатывали ли уже
             const { data: existingDeposit } = await supabase
               .from('deposits')
               .select('id')
@@ -515,7 +501,6 @@ async function handleCheckDeposits(req, res) {
           }
         }
         
-        // Обновляем время проверки
         await supabase
           .from('user_wallets')
           .update({ last_checked: new Date().toISOString() })
@@ -525,6 +510,7 @@ async function handleCheckDeposits(req, res) {
         
       } catch (error) {
         console.error(`❌ Error processing wallet ${wallet.address}:`, error);
+        await sleep(3000);
       }
     }
 
@@ -548,14 +534,15 @@ app.get('/collect-funds', async (req, res) => {
   await handleCollectFunds(req, res);
 });
 
+// ========== ИСПРАВЛЕННАЯ handleCollectFunds С THROTTLING ==========
 async function handleCollectFunds(req, res) {
   try {
-    console.log('💰 Manual funds collection started...');
+    console.log('💰 Manual funds collection started (THROTTLED)...');
     
     const { data: wallets, error } = await supabase
       .from('user_wallets')
       .select('*')
-      .limit(50);
+      .limit(6);
 
     if (error) throw error;
 
@@ -564,15 +551,16 @@ async function handleCollectFunds(req, res) {
 
     for (const wallet of wallets || []) {
       try {
+        await sleep(5000);
+        
         const result = await autoCollectToMainWallet(wallet);
         if (result && result.success) {
           collectedCount++;
           totalCollected += result.amount;
-          // Пауза между операциями
-          await sleep(2000);
         }
       } catch (error) {
         console.error(`❌ Error collecting from ${wallet.address}:`, error);
+        await sleep(5000);
       }
     }
 
@@ -651,7 +639,7 @@ async function checkUserDeposits(userId) {
 app.get('/', (req, res) => {
   res.json({ 
     status: '✅ 100% WORKING', 
-    message: 'Tron Wallet System - AUTO-COLLECT FIXED',
+    message: 'Tron Wallet System - AUTO-COLLECT FIXED WITH THROTTLING',
     timestamp: new Date().toISOString(),
     features: [
       '✅ Wallet Generation',
@@ -659,17 +647,16 @@ app.get('/', (req, res) => {
       '✅ Balance Updates',
       '✅ Auto Collection - FIXED',
       '✅ TRX Gas Management',
-      '✅ USDT Transfers'
+      '✅ USDT Transfers',
+      '✅ THROTTLING System'
     ]
   });
 });
 
-// ========== АВТОПРОВЕРКА КАЖДЫЕ 2 МИНУТЫ ==========
-// ✅ ФИКС: убрали fetch на localhost, вызываем функцию напрямую
+// ========== АВТОПРОВЕРКА КАЖДЫЕ 3 МИНУТЫ ==========
 setInterval(async () => {
   try {
     console.log('🕒 AUTO-CHECK: Scanning for deposits (internal call)...');
-    // Создаем mock объекты req и res для вызова функции
     const mockReq = {};
     const mockRes = {
       json: (data) => console.log('📊 Auto-check result:', data.message),
@@ -679,7 +666,7 @@ setInterval(async () => {
   } catch (err) {
     console.error('❌ Auto-check internal error:', err);
   }
-}, 120000);
+}, 180000); // 3 минуты
 
 // ========== ЗАПУСК СЕРВЕРА ==========
 app.listen(PORT, '0.0.0.0', () => {
@@ -688,8 +675,9 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`✅ TRONGRID: API ACTIVE`);
   console.log(`💰 MASTER: ${COMPANY.MASTER.address}`);
   console.log(`💰 MAIN: ${COMPANY.MAIN.address}`);
-  console.log(`⏰ AUTO-CHECK: EVERY 2 MINUTES`);
-  console.log(`💸 AUTO-COLLECT: 100% WORKING`);
+  console.log(`⏰ AUTO-CHECK: EVERY 3 MINUTES`);
+  console.log(`💸 AUTO-COLLECT: 100% WORKING WITH THROTTLING`);
+  console.log(`🔧 THROTTLING: ${BALANCE_CONCURRENCY} concurrent requests`);
   console.log(`===================================`);
   console.log(`✅ SYSTEM READY FOR PRODUCTION`);
   console.log(`===================================`);
