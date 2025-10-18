@@ -10,7 +10,7 @@
   "dependencies": {
     "express": "^4.18.2",
     "@supabase/supabase-js": "^2.38.0",
-    "tronweb": "^5.5.0"
+    "tronweb": "4.1.0"
   },
   "devDependencies": {
     "nodemon": "^3.0.1"
