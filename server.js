@@ -1,4 +1,4 @@
-// server.js — patched, robust version
+// server.js — fixed version with direct API calls
 const express = require('express');
 const { createClient } = require('@supabase/supabase-js');
 const TronWeb = require('tronweb');
@@ -116,9 +116,23 @@ function runBalanceQueue() {
 // ========== TronGrid request with retry/backoff ==========
 async function trongridRequestWithRetry(path, opts = {}, retries = 4, backoffMs = 800) {
   const base = 'https://api.trongrid.io/';
+  
+  // Ensure headers are properly set
+  const headers = {
+    'Accept': 'application/json',
+    'Content-Type': 'application/json',
+    'TRON-PRO-API-KEY': TRONGRID_API_KEY,
+    ...opts.headers
+  };
+  
+  const options = {
+    ...opts,
+    headers
+  };
+  
   for (let attempt = 0; attempt <= retries; attempt++) {
     try {
-      const res = await fetch(base + path, opts);
+      const res = await fetch(base + path, options);
       if (res.status === 429) {
         const wait = backoffMs * Math.pow(2, attempt);
         console.warn(`TronGrid 429 — wait ${wait}ms (attempt ${attempt + 1}/${retries + 1})`);
@@ -151,13 +165,11 @@ async function getUSDTBalance(address) {
       }
 
       // Ensure address is base58 or convert
-      // tronWeb.address.toHex accepts base58 and returns hex starting with '41'
       let ownerHex;
       try {
         ownerHex = tronWeb.address.toHex(address);
       } catch (e) {
         console.warn('getUSDTBalance: tronWeb.address.toHex failed for address', address, e && e.message);
-        // Try if address is already hex-like
         if (typeof address === 'string' && address.startsWith('41')) {
           ownerHex = address;
         } else {
@@ -165,14 +177,14 @@ async function getUSDTBalance(address) {
         }
       }
 
-      ownerHex = strip0x(ownerHex); // remove 0x if present
+      ownerHex = strip0x(ownerHex);
 
       // Contract address in hex
       let contractHex;
       try {
         contractHex = tronWeb.address.toHex(USDT_CONTRACT);
       } catch (e) {
-        contractHex = USDT_CONTRACT; // fallback
+        contractHex = USDT_CONTRACT;
       }
       contractHex = strip0x(contractHex);
 
@@ -189,11 +201,6 @@ async function getUSDTBalance(address) {
 
       const json = await trongridRequestWithRetry('wallet/triggerconstantcontract', {
         method: 'POST',
-        headers: {
-          'Accept': 'application/json',
-          'Content-Type': 'application/json',
-          'TRON-PRO-API-KEY': TRONGRID_API_KEY
-        },
         body: JSON.stringify(body)
       }, 3, 800);
 
@@ -209,14 +216,11 @@ async function getUSDTBalance(address) {
 
       const constRes = json.constant_result || json.constantResult || json.constantResults;
       if (!constRes || !Array.isArray(constRes) || constRes.length === 0) {
-        // No constant result - maybe 0 or method failed
-        // If there's a 'result' field, try to log it
         console.warn('getUSDTBalance: no constant_result in response', { address, json });
         return 0;
       }
 
       const hexBalance = String(constRes[0] || '0').replace(/^0x/, '');
-      // remove leading zeros for BigInt parsing
       const clean = hexBalance.replace(/^0+/, '') || '0';
       let bn;
       try {
@@ -226,9 +230,7 @@ async function getUSDTBalance(address) {
         return 0;
       }
 
-      const amount = Number(bn) / 1_000_000; // USDT has 6 decimals
-      // debug log
-      // console.log(`getUSDTBalance: ${address} => ${amount} USDT`);
+      const amount = Number(bn) / 1_000_000;
       return amount;
     } catch (err) {
       console.error('❌ getUSDTBalance fatal error:', err && err.message ? err.message : err);
@@ -242,9 +244,7 @@ async function getUSDTTransactions(address) {
   try {
     if (!address) return [];
     const path = `v1/accounts/${address}/transactions/trc20?limit=30&only_confirmed=true`;
-    const json = await trongridRequestWithRetry(path, {
-      headers: { Accept: 'application/json', 'TRON-PRO-API-KEY': TRONGRID_API_KEY }
-    }, 3, 800);
+    const json = await trongridRequestWithRetry(path, {}, 3, 800);
 
     const raw = json.data || [];
     const transactions = [];
@@ -253,7 +253,7 @@ async function getUSDTTransactions(address) {
       try {
         const tokenAddr = tx.token_info?.address || tx.contract || tx.tokenInfo?.address;
         if (!tokenAddr) continue;
-        if (tokenAddr !== USDT_CONTRACT) continue; // only USDT
+        if (tokenAddr !== USDT_CONTRACT) continue;
 
         const to = toBase58IfHex(tx.to || tx.to_address);
         const from = toBase58IfHex(tx.from || tx.from_address);
@@ -282,7 +282,67 @@ async function getUSDTTransactions(address) {
   }
 }
 
-// ========== transferUSDT & sendTRX ==========
+// ========== DIRECT API METHODS FOR TRX (FIXED) ==========
+async function getTRXBalance(address) {
+  try {
+    const json = await trongridRequestWithRetry(`v1/accounts/${address}`, {}, 3, 800);
+    
+    if (json && json.data && json.data.length > 0) {
+      const balance = json.data[0].balance || 0;
+      return balance / 1_000_000;
+    }
+    return 0;
+  } catch (error) {
+    console.error('❌ TRX balance error:', error && error.message ? error.message : error);
+    return 0;
+  }
+}
+
+async function sendTRX(fromPrivateKey, toAddress, amount) {
+  try {
+    const pk = normalizePrivateKeyForTron(fromPrivateKey);
+    if (!pk) {
+      console.error('sendTRX: missing private key');
+      return false;
+    }
+
+    // Create transaction using TronWeb but without headers in constructor
+    const tronWebForSigning = new TronWeb({
+      fullHost: 'https://api.trongrid.io',
+      privateKey: pk
+    });
+
+    const fromAddress = tronWebForSigning.address.fromPrivateKey(pk);
+    
+    // Create transaction
+    const transaction = await tronWebForSigning.transactionBuilder.sendTrx(
+      toAddress,
+      tronWebForSigning.toSun(amount),
+      fromAddress
+    );
+
+    // Sign transaction
+    const signedTransaction = await tronWebForSigning.trx.sign(transaction);
+    
+    // Broadcast using direct API call to avoid header issues
+    const broadcastResult = await trongridRequestWithRetry('wallet/broadcasttransaction', {
+      method: 'POST',
+      body: JSON.stringify(signedTransaction)
+    }, 3, 800);
+
+    if (broadcastResult && broadcastResult.result === true) {
+      console.log(`✅ TRX sent: ${amount} TRX to ${toAddress}, txid: ${broadcastResult.txid}`);
+      return true;
+    } else {
+      console.error('❌ TRX send failed:', broadcastResult);
+      return false;
+    }
+  } catch (error) {
+    console.error('❌ TRX send error:', error && error.message ? error.message : error);
+    return false;
+  }
+}
+
 async function transferUSDT(fromPrivateKey, toAddress, amount) {
   try {
     const pk = normalizePrivateKeyForTron(fromPrivateKey);
@@ -291,16 +351,13 @@ async function transferUSDT(fromPrivateKey, toAddress, amount) {
       return false;
     }
 
-    // Создаем чистый экземпляр TronWeb без лишних заголовков
-    const tronWebWithPrivateKey = new TronWeb({
+    // Create TronWeb instance for signing
+    const tronWebForSigning = new TronWeb({
       fullHost: 'https://api.trongrid.io',
       privateKey: pk
     });
 
-    // Устанавливаем заголовок отдельно
-    tronWebWithPrivateKey.setHeader({'TRON-PRO-API-KEY': TRONGRID_API_KEY});
-
-    const contract = await tronWebWithPrivateKey.contract().at(USDT_CONTRACT);
+    const contract = await tronWebForSigning.contract().at(USDT_CONTRACT);
     const amountInSun = Math.floor(amount * 1_000_000);
 
     console.log(`🔄 Sending ${amount} USDT to ${toAddress}...`);
@@ -316,65 +373,6 @@ async function transferUSDT(fromPrivateKey, toAddress, amount) {
   } catch (error) {
     console.error('❌ USDT transfer error:', error && error.message ? error.message : error);
     return false;
-  }
-}
-
-async function sendTRX(fromPrivateKey, toAddress, amount) {
-  try {
-    const pk = normalizePrivateKeyForTron(fromPrivateKey);
-    if (!pk) {
-      console.error('sendTRX: missing private key');
-      return false;
-    }
-
-    // Создаем чистый экземпляр TronWeb без лишних заголовков
-    const tronWebWithPrivateKey = new TronWeb({
-      fullHost: 'https://api.trongrid.io',
-      privateKey: pk
-    });
-
-    // Устанавливаем заголовок отдельно
-    tronWebWithPrivateKey.setHeader({'TRON-PRO-API-KEY': TRONGRID_API_KEY});
-
-    const fromAddress = tronWebWithPrivateKey.address.fromPrivateKey(pk);
-    const transaction = await tronWebWithPrivateKey.transactionBuilder.sendTrx(
-      toAddress,
-      tronWebWithPrivateKey.toSun(amount),
-      fromAddress
-    );
-
-    const signedTransaction = await tronWebWithPrivateKey.trx.sign(transaction);
-    const result = await tronWebWithPrivateKey.trx.sendRawTransaction(signedTransaction);
-
-    if (result && result.result) {
-      console.log(`✅ TRX sent: ${amount} TRX to ${toAddress}`);
-      return true;
-    } else {
-      console.error('❌ TRX send returned unexpected result:', result);
-      return false;
-    }
-  } catch (error) {
-    console.error('❌ TRX send error:', error && error.message ? error.message : error);
-    return false;
-  }
-}
-
-// ========== getTRXBalance ==========
-async function getTRXBalance(address) {
-  try {
-    // Создаем чистый экземпляр для запроса баланса
-    const tronWebForBalance = new TronWeb({
-      fullHost: 'https://api.trongrid.io'
-    });
-    
-    // Устанавливаем заголовок отдельно
-    tronWebForBalance.setHeader({'TRON-PRO-API-KEY': TRONGRID_API_KEY});
-    
-    const balance = await tronWebForBalance.trx.getBalance(address);
-    return balance / 1_000_000;
-  } catch (error) {
-    console.error('❌ TRX balance error:', error && error.message ? error.message : error);
-    return 0;
   }
 }
 
@@ -402,8 +400,9 @@ async function autoCollectToMainWallet(wallet) {
         return { success: false, reason: 'funding_failed' };
       }
       // wait a bit for TRX to settle
-      await sleep(8000);
+      await sleep(15000); // Increased wait time
       const newTrx = await getTRXBalance(wallet.address);
+      console.log(`🔄 New TRX balance after funding: ${newTrx} TRX`);
       if (newTrx < MIN_TRX_FOR_FEE) {
         console.log('❌ TRX still insufficient after funding');
         return { success: false, reason: 'trx_still_insufficient' };
@@ -692,7 +691,7 @@ async function checkUserDeposits(userId) {
 app.get('/', (req, res) => {
   res.json({
     status: '✅ WORKING',
-    message: 'Tron Wallet System - AUTO-COLLECT (patched)',
+    message: 'Tron Wallet System - AUTO-COLLECT (FIXED HEADERS)',
     timestamp: new Date().toISOString(),
     features: [
       'Wallet Generation',
