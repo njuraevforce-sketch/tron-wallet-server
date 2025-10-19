@@ -1,4 +1,4 @@
-// server.js — fixed version with duplicate protection
+// server.js — ТОЛЬКО УБРАЛ ХАРДКОД МАСТЕР-КОШЕЛЬКОВ
 const express = require('express');
 const { createClient } = require('@supabase/supabase-js');
 const TronWeb = require('tronweb');
@@ -6,24 +6,20 @@ const TronWeb = require('tronweb');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-/**
- * IMPORTANT: For production, move these into environment variables in Railway
- * e.g. process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY, etc.
- * Hardcoded values used here only for continuity with your environment.
- */
+// ========== ENVIRONMENT VARIABLES ==========
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://bpsmizhrzgfbjqfpqkcz.supabase.co';
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || 'eyJhbGciOi...'; // replace in env
 const TRONGRID_API_KEY = process.env.TRONGRID_API_KEY || '19e2411a-3c3e-479d-8c85-2abc716af397';
 
-// COMPANY wallets - move these to env in production
+// COMPANY wallets - ТОЛЬКО ИЗ ПЕРЕМЕННЫХ ОКРУЖЕНИЯ (без хардкода)
 const COMPANY = {
   MASTER: {
-    address: process.env.MASTER_ADDRESS || 'TPuGfq19uZN7mNRrgjzfTnrexC9gKFMo7Z',
-    privateKey: process.env.MASTER_PRIVATE_KEY || '600eedecf2d0553ad1157e66a6ed9bbab049216383a851e3ff7ab430ca3c2634'
+    address: process.env.MASTER_ADDRESS,
+    privateKey: process.env.MASTER_PRIVATE_KEY
   },
   MAIN: {
-    address: process.env.MAIN_ADDRESS || 'TBwcRtgvbwFicGWtX4PvwWpw5EGMmAiaNS',
-    privateKey: process.env.MAIN_PRIVATE_KEY || '6a94e6b9f9d49ce41155f301b7593dc0aed0d4bbff887f2af225a84a69294a76'
+    address: process.env.MAIN_ADDRESS,
+    privateKey: process.env.MAIN_PRIVATE_KEY
   }
 };
 
@@ -784,8 +780,8 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`🚀 SERVER RUNNING on port ${PORT}`);
   console.log(`✅ SUPABASE: ${SUPABASE_URL ? 'CONNECTED' : 'MISSING'}`);
   console.log(`✅ TRONGRID: API KEY ${TRONGRID_API_KEY ? 'SET' : 'MISSING'}`);
-  console.log(`💰 MASTER: ${COMPANY.MASTER.address}`);
-  console.log(`💰 MAIN: ${COMPANY.MAIN.address}`);
+  console.log(`💰 MASTER: ${COMPANY.MASTER.address ? COMPANY.MASTER.address : 'MISSING (check env variables)'}`);
+  console.log(`💰 MAIN: ${COMPANY.MAIN.address ? COMPANY.MAIN.address : 'MISSING (check env variables)'}`);
   console.log(`⏰ AUTO-CHECK: EVERY ${Math.round(CHECK_INTERVAL_MS / 1000)}s`);
   console.log(`🔧 THROTTLING: ${BALANCE_CONCURRENCY} concurrent requests`);
   console.log(`🛡️  DUPLICATE PROTECTION: ENABLED`);
