@@ -1,4 +1,4 @@
-// server.js — ТОЛЬКО УБРАЛ ХАРДКОД МАСТЕР-КОШЕЛЬКОВ
+// server.js — ФИНАЛЬНАЯ ВЕРСИЯ С АДРЕСАМИ В КОДЕ И КЛЮЧАМИ В ПЕРЕМЕННЫХ
 const express = require('express');
 const { createClient } = require('@supabase/supabase-js');
 const TronWeb = require('tronweb');
@@ -11,14 +11,14 @@ const SUPABASE_URL = process.env.SUPABASE_URL || 'https://bpsmizhrzgfbjqfpqkcz.s
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || 'eyJhbGciOi...'; // replace in env
 const TRONGRID_API_KEY = process.env.TRONGRID_API_KEY || '19e2411a-3c3e-479d-8c85-2abc716af397';
 
-// COMPANY wallets - ТОЛЬКО ИЗ ПЕРЕМЕННЫХ ОКРУЖЕНИЯ (без хардкода)
+// COMPANY wallets - АДРЕСА В КОДЕ, КЛЮЧИ В ПЕРЕМЕННЫХ
 const COMPANY = {
   MASTER: {
-    address: process.env.MASTER_ADDRESS,
+    address: 'TKn5J3ZnTxE9fmgMhVjXognH4VUjx4Tid2',
     privateKey: process.env.MASTER_PRIVATE_KEY
   },
   MAIN: {
-    address: process.env.MAIN_ADDRESS,
+    address: 'TNVpDk1JZSxmC9XniB1tSPaRdAvvKMMavC',
     privateKey: process.env.MAIN_PRIVATE_KEY
   }
 };
@@ -780,8 +780,8 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`🚀 SERVER RUNNING on port ${PORT}`);
   console.log(`✅ SUPABASE: ${SUPABASE_URL ? 'CONNECTED' : 'MISSING'}`);
   console.log(`✅ TRONGRID: API KEY ${TRONGRID_API_KEY ? 'SET' : 'MISSING'}`);
-  console.log(`💰 MASTER: ${COMPANY.MASTER.address ? COMPANY.MASTER.address : 'MISSING (check env variables)'}`);
-  console.log(`💰 MAIN: ${COMPANY.MAIN.address ? COMPANY.MAIN.address : 'MISSING (check env variables)'}`);
+  console.log(`💰 MASTER: ${COMPANY.MASTER.address}`);
+  console.log(`💰 MAIN: ${COMPANY.MAIN.address}`);
   console.log(`⏰ AUTO-CHECK: EVERY ${Math.round(CHECK_INTERVAL_MS / 1000)}s`);
   console.log(`🔧 THROTTLING: ${BALANCE_CONCURRENCY} concurrent requests`);
   console.log(`🛡️  DUPLICATE PROTECTION: ENABLED`);
