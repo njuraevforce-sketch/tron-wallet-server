@@ -1,4 +1,4 @@
-// server.js — fixed version with direct API calls
+// server.js — fixed version with duplicate protection
 const express = require('express');
 const { createClient } = require('@supabase/supabase-js');
 const TronWeb = require('tronweb');
@@ -440,13 +440,53 @@ async function autoCollectToMainWallet(wallet) {
   }
 }
 
-// ========== processDeposit ==========
+// ========== ATOMIC DEPOSIT PROCESSING ==========
 async function processDeposit(wallet, amount, txid) {
   try {
-    console.log(`💰 PROCESSING DEPOSIT: ${amount} USDT for user ${wallet.user_id}`);
+    console.log(`💰 PROCESSING DEPOSIT: ${amount} USDT for user ${wallet.user_id}, txid: ${txid}`);
+
+    // АТОМАРНАЯ ПРОВЕРКА: проверяем существующий депозит с этим txid
+    const { data: existingDeposit, error: checkError } = await supabase
+      .from('deposits')
+      .select('id, status, amount')
+      .eq('txid', txid)
+      .maybeSingle();
+
+    if (checkError) {
+      console.error('Error checking existing deposit:', checkError);
+      throw checkError;
+    }
+
+    if (existingDeposit) {
+      console.log(`✅ Deposit already processed: ${txid}, status: ${existingDeposit.status}, amount: ${existingDeposit.amount}`);
+      return { success: false, reason: 'already_processed', existing: existingDeposit };
+    }
 
     await ensureUserExists(wallet.user_id);
 
+    // Создаем запись о депозите СРАЗУ со статусом 'processing'
+    const { data: newDeposit, error: depositError } = await supabase
+      .from('deposits')
+      .insert({
+        user_id: wallet.user_id,
+        amount,
+        txid,
+        status: 'processing',
+        created_at: new Date().toISOString()
+      })
+      .select()
+      .single();
+
+    if (depositError) {
+      // Если ошибка уникальности - значит депозит уже обрабатывается параллельно
+      if (depositError.code === '23505') {
+        console.log(`🔄 Deposit already being processed by another thread: ${txid}`);
+        return { success: false, reason: 'concurrent_processing' };
+      }
+      throw new Error(`Deposit insert failed: ${depositError.message}`);
+    }
+
+    // Получаем текущие данные пользователя
     const { data: user, error: userError } = await supabase
       .from('users')
       .select('balance, total_profit, vip_level')
@@ -454,14 +494,16 @@ async function processDeposit(wallet, amount, txid) {
       .single();
 
     if (userError) {
-      throw new Error(`user fetch error: ${userError.message || JSON.stringify(userError)}`);
+      // Удаляем временную запись депозита в случае ошибки
+      await supabase.from('deposits').delete().eq('id', newDeposit.id);
+      throw new Error(`user fetch error: ${userError.message}`);
     }
 
     const currentBalance = Number(user.balance) || 0;
     const newBalance = currentBalance + amount;
     const newTotalProfit = (Number(user.total_profit) || 0) + amount;
 
-    // update balance
+    // Обновляем баланс пользователя
     const { error: updateError } = await supabase
       .from('users')
       .update({
@@ -472,54 +514,62 @@ async function processDeposit(wallet, amount, txid) {
       .eq('id', wallet.user_id);
 
     if (updateError) {
+      // Удаляем временную запись депозита в случае ошибки
+      await supabase.from('deposits').delete().eq('id', newDeposit.id);
       throw new Error(`Balance update failed: ${updateError.message}`);
     }
 
-    // insert deposit, but avoid duplicates using txid check
-    const { data: existing } = await supabase
+    // Обновляем статус депозита на 'confirmed'
+    await supabase
       .from('deposits')
-      .select('id')
-      .eq('txid', txid)
-      .single();
+      .update({ status: 'confirmed' })
+      .eq('id', newDeposit.id);
 
-    if (!existing) {
-      await supabase.from('deposits').insert({
-        user_id: wallet.user_id,
-        amount,
-        txid,
-        status: 'confirmed',
-        created_at: new Date().toISOString()
-      });
-    } else {
-      console.log('Deposit already recorded for txid', txid);
-    }
-
+    // Создаем запись в транзакциях
     await supabase.from('transactions').insert({
       user_id: wallet.user_id,
       type: 'deposit',
       amount,
-      description: 'Депозит USDT (TRC20)',
+      description: `Депозит USDT (TRC20) - ${txid.substring(0, 10)}...`,
       status: 'completed',
       created_at: new Date().toISOString()
     });
 
+    // Обновляем VIP уровень если нужно
     if (newBalance >= 30 && user.vip_level === 0) {
-      await supabase.from('users').update({ vip_level: 1 }).eq('id', wallet.user_id);
+      await supabase
+        .from('users')
+        .update({ vip_level: 1 })
+        .eq('id', wallet.user_id);
       console.log(`⭐ VIP Level upgraded to 1 for user ${wallet.user_id}`);
     }
 
     console.log(`✅ DEPOSIT PROCESSED: ${amount} USDT for user ${wallet.user_id}`);
     console.log(`💰 New balance: ${newBalance} USDT`);
 
-    // run auto-collect (non-blocking)
+    // Запускаем авто-сбор (неблокирующе) с задержкой
     setTimeout(() => {
       autoCollectToMainWallet(wallet).catch(err => {
         console.error('Auto-collect post-deposit failed:', err && err.message ? err.message : err);
       });
-    }, 1000);
+    }, 10000); // Увеличиваем задержку до 10 секунд
+
+    return { success: true, amount, deposit_id: newDeposit.id };
 
   } catch (error) {
     console.error('❌ Error processing deposit:', error && error.message ? error.message : error);
+    
+    // Пытаемся очистить временные записи в случае ошибки
+    try {
+      await supabase
+        .from('deposits')
+        .delete()
+        .eq('txid', txid)
+        .eq('status', 'processing');
+    } catch (cleanupError) {
+      console.error('Cleanup error:', cleanupError);
+    }
+    
     throw error;
   }
 }
@@ -574,19 +624,25 @@ async function handleCheckDeposits(req = {}, res = {}) {
     console.log(`🔍 Checking ${wallets?.length || 0} wallets with throttling`);
     let processedCount = 0;
     let depositsFound = 0;
+    let duplicatesSkipped = 0;
 
     for (const wallet of wallets || []) {
       try {
         // throttle between wallets to reduce chance of 429s
         await sleep(200);
         const transactions = await getUSDTTransactions(wallet.address);
+        
         for (const tx of transactions) {
           if (tx.to === wallet.address && tx.token === 'USDT' && tx.amount >= MIN_DEPOSIT) {
-            const { data: existingDeposit } = await supabase.from('deposits').select('id').eq('txid', tx.transaction_id).single();
-            if (!existingDeposit) {
-              console.log(`💰 NEW DEPOSIT: ${tx.amount} USDT for ${wallet.user_id}`);
-              await processDeposit(wallet, tx.amount, tx.transaction_id);
-              depositsFound++;
+            try {
+              const result = await processDeposit(wallet, tx.amount, tx.transaction_id);
+              if (result.success) {
+                depositsFound++;
+              } else if (result.reason === 'already_processed' || result.reason === 'concurrent_processing') {
+                duplicatesSkipped++;
+              }
+            } catch (err) {
+              console.error(`❌ Error processing deposit ${tx.transaction_id}:`, err && err.message ? err.message : err);
             }
           }
         }
@@ -598,7 +654,7 @@ async function handleCheckDeposits(req = {}, res = {}) {
       }
     }
 
-    const message = `✅ Processed ${processedCount} wallets, found ${depositsFound} new deposits`;
+    const message = `✅ Processed ${processedCount} wallets, found ${depositsFound} new deposits, skipped ${duplicatesSkipped} duplicates`;
     console.log(message);
     if (res && typeof res.json === 'function') res.json({ success: true, message });
     return { success: true, message };
@@ -672,18 +728,26 @@ async function checkUserDeposits(userId) {
   try {
     const { data: wallet } = await supabase.from('user_wallets').select('*').eq('user_id', userId).single();
     if (!wallet) return;
+    
+    console.log(`🔍 Checking deposits for user ${userId}, wallet: ${wallet.address}`);
     const transactions = await getUSDTTransactions(wallet.address);
+    
     for (const tx of transactions) {
       if (tx.to === wallet.address && tx.token === 'USDT' && tx.amount >= MIN_DEPOSIT) {
-        const { data: existing } = await supabase.from('deposits').select('id').eq('txid', tx.transaction_id).single();
-        if (!existing) {
-          console.log(`💰 FOUND DEPOSIT ON CHECK: ${tx.amount} USDT`);
-          await processDeposit(wallet, tx.amount, tx.transaction_id);
+        try {
+          const result = await processDeposit(wallet, tx.amount, tx.transaction_id);
+          if (result.success) {
+            console.log(`💰 FOUND NEW DEPOSIT: ${tx.amount} USDT for user ${userId}`);
+          } else if (result.reason === 'already_processed') {
+            console.log(`✅ Deposit already processed: ${tx.transaction_id}`);
+          }
+        } catch (err) {
+          console.error(`❌ Error processing transaction ${tx.transaction_id}:`, err);
         }
       }
     }
   } catch (error) {
-    console.error('❌ checkUserDeposits error:', error && error.message ? error.message : error);
+    console.error('❌ checkUserDeposits error:', error);
   }
 }
 
@@ -691,15 +755,16 @@ async function checkUserDeposits(userId) {
 app.get('/', (req, res) => {
   res.json({
     status: '✅ WORKING',
-    message: 'Tron Wallet System - AUTO-COLLECT (FIXED HEADERS)',
+    message: 'Tron Wallet System - DUPLICATE PROTECTION',
     timestamp: new Date().toISOString(),
     features: [
       'Wallet Generation',
-      'Deposit Processing',
+      'Deposit Processing (Atomic)',
       'Balance Updates',
       'Auto Collection (throttled)',
       'TRX Gas Management',
-      'USDT Transfers'
+      'USDT Transfers',
+      'DUPLICATE PROTECTION'
     ]
   });
 });
@@ -723,5 +788,6 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`💰 MAIN: ${COMPANY.MAIN.address}`);
   console.log(`⏰ AUTO-CHECK: EVERY ${Math.round(CHECK_INTERVAL_MS / 1000)}s`);
   console.log(`🔧 THROTTLING: ${BALANCE_CONCURRENCY} concurrent requests`);
+  console.log(`🛡️  DUPLICATE PROTECTION: ENABLED`);
   console.log('===================================');
 });
