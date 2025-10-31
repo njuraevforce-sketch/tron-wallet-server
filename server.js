@@ -40,7 +40,7 @@ app.use((req, res, next) => {
 
 // ========== CONSTANTS ==========
 const USDT_CONTRACT = 'TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t';
-const MIN_DEPOSIT = 30;
+const MIN_DEPOSIT = 20; // ИЗМЕНЕНО: было 30, стало 20
 const KEEP_AMOUNT = 1.0;
 const MIN_TRX_FOR_FEE = 3;
 const FUND_TRX_AMOUNT = 10;
@@ -532,7 +532,7 @@ async function processDeposit(wallet, amount, txid) {
     });
 
     // Обновляем VIP уровень если нужно
-    if (newBalance >= 30 && user.vip_level === 0) {
+    if (newBalance >= 20 && user.vip_level === 0) { // ИЗМЕНЕНО: было 30, стало 20
       await supabase
         .from('users')
         .update({ vip_level: 1 })
