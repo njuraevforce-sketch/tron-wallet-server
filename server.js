@@ -1,4 +1,4 @@
-// server.js — ФИНАЛЬНАЯ ВЕРСИЯ С ПОДДЕРЖКОЙ TRC20 И BEP20 (FIXED FOR NODE 18)
+// server.js — ФИНАЛЬНАЯ ВЕРСИЯ С ETHERSCAN API V2
 const express = require('express');
 const { createClient } = require('@supabase/supabase-js');
 const TronWeb = require('tronweb');
@@ -11,11 +11,22 @@ const PORT = process.env.PORT || 3000;
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://bpsmizhrzgfbjqfpqkcz.supabase.co';
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || 'eyJhbGciOi...';
 const TRONGRID_API_KEY = process.env.TRONGRID_API_KEY || '19e2411a-3c3e-479d-8c85-2abc716af397';
-const BSC_RPC_URL = process.env.BSC_RPC_URL || 'https://bsc-dataseed.binance.org/';
 
-// ========== BSCSCAN API CONFIG ==========
-const BSCSCAN_API_KEY = process.env.BSCSCAN_API_KEY || 'AI7FBXG5EU2ENYZNUK988RIMEB5R68N6FT';
-const BSCSCAN_API_URL = 'https://api.bscscan.com/api';
+// ========== ETHERSCAN API V2 CONFIGURATION ==========
+const ETHERSCAN_API_KEY = process.env.ETHERSCAN_API_KEY || 'AI7FBXG5EU2ENYZNUK988RIMEB5R68N6FT';
+const ETHERSCAN_API_URL = 'https://api.etherscan.io/v2/api';
+const BSC_CHAIN_ID = '56'; // Chain ID for BSC
+
+const BSC_RPC_URLS = [
+  'https://bsc-dataseed.binance.org/',
+  'https://bsc-dataseed1.defibit.io/',
+  'https://bsc-dataseed1.ninicoin.io/',
+  'https://bsc-dataseed2.ninicoin.io/',
+];
+
+function getRandomBscRpc() {
+  return BSC_RPC_URLS[Math.floor(Math.random() * BSC_RPC_URLS.length)];
+}
 
 // COMPANY wallets - TRC20
 const COMPANY = {
@@ -48,8 +59,8 @@ const tronWeb = new TronWeb({
   headers: { 'TRON-PRO-API-KEY': TRONGRID_API_KEY }
 });
 
-// FIXED: BSC provider для Node.js 18
-const bscProvider = new ethers.providers.JsonRpcProvider(BSC_RPC_URL);
+// FIXED: BSC provider с ротацией
+const bscProvider = new ethers.providers.JsonRpcProvider(getRandomBscRpc());
 
 app.use(express.json());
 app.use((req, res, next) => {
@@ -183,7 +194,6 @@ async function getBSCUSDTBalance(address) {
   try {
     const contract = new ethers.Contract(USDT_BSC_CONTRACT, USDT_ABI, bscProvider);
     const balance = await contract.balanceOf(address);
-    // FIXED: formatUnits для Node.js 18
     return Number(ethers.utils.formatUnits(balance, 6));
   } catch (error) {
     console.error('❌ BSC USDT balance error:', error.message);
@@ -193,53 +203,92 @@ async function getBSCUSDTBalance(address) {
 
 async function getBSCTransactions(address) {
   try {
-    const params = new URLSearchParams({
-      module: 'account',
-      action: 'tokentx',
-      address: address,
-      contractaddress: USDT_BSC_CONTRACT,
-      page: '1',
-      offset: '50',
-      sort: 'desc',
-      apikey: BSCSCAN_API_KEY
-    });
+    // Сначала пробуем Etherscan API V2
+    try {
+      const params = new URLSearchParams({
+        chainid: BSC_CHAIN_ID,
+        module: 'account',
+        action: 'tokentx',
+        address: address,
+        contractaddress: USDT_BSC_CONTRACT,
+        page: '1',
+        offset: '20',
+        sort: 'desc',
+        apikey: ETHERSCAN_API_KEY
+      });
 
-    const response = await fetch(`${BSCSCAN_API_URL}?${params}`);
-    const data = await response.json();
+      const response = await fetch(`${ETHERSCAN_API_URL}?${params}`);
+      const data = await response.json();
 
-    if (data.status !== '1' || !data.result) {
-      console.log('📭 No BSC transactions found or API error:', data.message);
+      if (data.status === '1' && data.result) {
+        console.log(`✅ Etherscan API V2: Found ${data.result.length} transactions for ${address}`);
+        
+        const transactions = [];
+        for (const tx of data.result) {
+          if (tx.to.toLowerCase() === address.toLowerCase() && 
+              tx.contractAddress.toLowerCase() === USDT_BSC_CONTRACT.toLowerCase()) {
+            
+            transactions.push({
+              transaction_id: tx.hash,
+              to: tx.to,
+              from: tx.from,
+              amount: Number(tx.value) / 1e6,
+              token: 'USDT',
+              confirmed: parseInt(tx.confirmations) > 0,
+              network: 'BEP20'
+            });
+          }
+        }
+        return transactions;
+      } else {
+        console.log(`⚠️ Etherscan API V2 returned: ${data.message || 'Unknown error'}`);
+        // Продолжаем к fallback методу
+      }
+    } catch (apiError) {
+      console.log(`⚠️ Etherscan API V2 failed: ${apiError.message}`);
+    }
+
+    // Fallback метод - используем прямой RPC запрос с ограниченным диапазоном блоков
+    console.log(`🔄 Using RPC fallback for BSC transactions: ${address}`);
+    
+    const currentBlock = await bscProvider.getBlockNumber();
+    const fromBlock = Math.max(currentBlock - 5000, 0); // Только последние ~16 часов
+    
+    const contract = new ethers.Contract(USDT_BSC_CONTRACT, USDT_ABI, bscProvider);
+    const filter = contract.filters.Transfer(null, address);
+    
+    try {
+      const events = await contract.queryFilter(filter, fromBlock, currentBlock);
+      
+      const transactions = [];
+      for (const event of events) {
+        try {
+          const receipt = await event.getTransactionReceipt();
+          if (receipt && receipt.status === 1) {
+            transactions.push({
+              transaction_id: event.transactionHash,
+              to: event.args.to,
+              from: event.args.from,
+              amount: Number(ethers.utils.formatUnits(event.args.value, 6)),
+              token: 'USDT',
+              confirmed: true,
+              network: 'BEP20'
+            });
+          }
+        } catch (innerErr) {
+          continue;
+        }
+      }
+      
+      console.log(`✅ RPC fallback: Found ${transactions.length} transactions for ${address}`);
+      return transactions;
+    } catch (rpcError) {
+      console.error(`❌ RPC fallback also failed: ${rpcError.message}`);
       return [];
     }
 
-    const transactions = [];
-    
-    for (const tx of data.result) {
-      try {
-        // Проверяем, что это входящая транзакция на наш адрес
-        if (tx.to.toLowerCase() === address.toLowerCase() && 
-            tx.contractAddress.toLowerCase() === USDT_BSC_CONTRACT.toLowerCase()) {
-          
-          transactions.push({
-            transaction_id: tx.hash,
-            to: tx.to,
-            from: tx.from,
-            amount: Number(tx.value) / 1e6, // USDT имеет 6 decimals
-            token: 'USDT',
-            confirmed: parseInt(tx.confirmations) > 0,
-            network: 'BEP20'
-          });
-        }
-      } catch (innerErr) {
-        console.warn('Skipping malformed BSC tx:', innerErr.message);
-        continue;
-      }
-    }
-
-    console.log(`✅ Found ${transactions.length} BSC transactions for ${address}`);
-    return transactions;
   } catch (error) {
-    console.error('❌ BSC transactions error (BscScan API):', error.message);
+    console.error('❌ BSC transactions error:', error.message);
     return [];
   }
 }
@@ -247,7 +296,6 @@ async function getBSCTransactions(address) {
 async function getBSCBalance(address) {
   try {
     const balance = await bscProvider.getBalance(address);
-    // FIXED: formatEther для Node.js 18
     return Number(ethers.utils.formatEther(balance));
   } catch (error) {
     console.error('❌ BSC balance error:', error.message);
@@ -258,7 +306,6 @@ async function getBSCBalance(address) {
 async function sendBSC(fromPrivateKey, toAddress, amount) {
   try {
     const wallet = new ethers.Wallet(fromPrivateKey, bscProvider);
-    // FIXED: parseEther для Node.js 18
     const tx = await wallet.sendTransaction({
       to: toAddress,
       value: ethers.utils.parseEther(amount.toString())
@@ -278,7 +325,6 @@ async function transferBSCUSDT(fromPrivateKey, toAddress, amount) {
     const wallet = new ethers.Wallet(fromPrivateKey, bscProvider);
     const contract = new ethers.Contract(USDT_BSC_CONTRACT, USDT_ABI, wallet);
     
-    // FIXED: parseUnits для Node.js 18
     const amountInWei = ethers.utils.parseUnits(amount.toString(), 6);
     const tx = await contract.transfer(toAddress, amountInWei);
     
@@ -788,7 +834,12 @@ async function handleCheckDeposits(req = {}, res = {}) {
 
     for (const wallet of wallets || []) {
       try {
-        await sleep(200);
+        if (wallet.network === 'BEP20') {
+          await sleep(3000); // 3 секунды для BSC кошельков
+        } else {
+          await sleep(200); // 200ms для TRC20
+        }
+        
         let transactions = [];
 
         if (wallet.network === 'TRC20') {
@@ -949,7 +1000,7 @@ app.get('/', (req, res) => {
       'Gas Management (TRX/BNB)',
       'USDT Transfers',
       'DUPLICATE PROTECTION',
-      'BscScan API Integration'
+      'Etherscan API V2 Integration'
     ]
   });
 });
@@ -969,8 +1020,8 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`🚀 SERVER RUNNING on port ${PORT}`);
   console.log(`✅ SUPABASE: ${SUPABASE_URL ? 'CONNECTED' : 'MISSING'}`);
   console.log(`✅ TRONGRID: API KEY ${TRONGRID_API_KEY ? 'SET' : 'MISSING'}`);
-  console.log(`✅ BSC RPC: ${BSC_RPC_URL ? 'CONNECTED' : 'MISSING'}`);
-  console.log(`✅ BSCSCAN API: KEY SET (${BSCSCAN_API_KEY.substring(0, 8)}...)`);
+  console.log(`✅ BSC RPC: MULTI-PROVIDER WITH ROTATION`);
+  console.log(`✅ ETHERSCAN API V2: KEY SET (${ETHERSCAN_API_KEY.substring(0, 8)}...)`);
   console.log(`💰 TRC20 MASTER: ${COMPANY.MASTER.address}`);
   console.log(`💰 TRC20 MAIN: ${COMPANY.MAIN.address}`);
   console.log(`💰 BEP20 MASTER: ${COMPANY_BSC.MASTER.address}`);
