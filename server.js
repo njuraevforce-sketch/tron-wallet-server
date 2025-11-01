@@ -1,4 +1,4 @@
-// server.js — UPDATED (ETHERSCAN API V2 integration + chunked RPC fallback)
+// server.js — UPDATED (IMPROVED BSC RPC HANDLING + HEALTH CHECK)
 const express = require('express');
 const { createClient } = require('@supabase/supabase-js');
 const TronWeb = require('tronweb');
@@ -14,19 +14,45 @@ const TRONGRID_API_KEY = process.env.TRONGRID_API_KEY || '19e2411a-3c3e-479d-8c8
 
 // ========== ETHERSCAN API V2 CONFIGURATION ==========
 const ETHERSCAN_API_KEY = process.env.ETHERSCAN_API_KEY || 'AI7FBXG5EU2ENYZNUK988RIMEB5R68N6FT';
-// Use main Etherscan endpoint and pass chainid=56 for BSC (Etherscan V2 multichain)
 const ETHERSCAN_API_URL = process.env.ETHERSCAN_API_URL || 'https://api.etherscan.io/api';
-const BSC_CHAIN_ID = '56'; // Chain ID for BSC
+const BSC_CHAIN_ID = '56';
 
+// ========== BSC RPC CONFIGURATION ==========
 const BSC_RPC_URLS = [
   'https://bsc-dataseed.binance.org/',
   'https://bsc-dataseed1.defibit.io/',
   'https://bsc-dataseed1.ninicoin.io/',
   'https://bsc-dataseed2.ninicoin.io/',
+  'https://bsc-dataseed3.ninicoin.io/',
+  'https://bsc-dataseed4.ninicoin.io/',
+  'https://bsc-mainnet.nodereal.io/v1/64a9df0874fb4a93b9d0a3849de012d3',
+  'https://1rpc.io/bnb',
+  'https://bsc-mainnet.public.blastapi.io',
+  'https://bsc.publicnode.com'
 ];
 
-function getRandomBscRpc() {
-  return BSC_RPC_URLS[Math.floor(Math.random() * BSC_RPC_URLS.length)];
+// Трекер работоспособности RPC
+const rpcHealth = new Map();
+BSC_RPC_URLS.forEach(url => rpcHealth.set(url, { healthy: true, lastError: 0 }));
+
+function getHealthyBscRpc() {
+  const now = Date.now();
+  const healthyRpcs = BSC_RPC_URLS.filter(url => {
+    const health = rpcHealth.get(url);
+    return health.healthy || (now - health.lastError > 60000);
+  });
+  
+  if (healthyRpcs.length === 0) {
+    BSC_RPC_URLS.forEach(url => rpcHealth.set(url, { healthy: true, lastError: 0 }));
+    return BSC_RPC_URLS[Math.floor(Math.random() * BSC_RPC_URLS.length)];
+  }
+  
+  return healthyRpcs[Math.floor(Math.random() * healthyRpcs.length)];
+}
+
+function markRpcUnhealthy(url) {
+  rpcHealth.set(url, { healthy: false, lastError: Date.now() });
+  console.log(`🔴 Marked RPC as unhealthy: ${url}`);
 }
 
 // COMPANY wallets - TRC20
@@ -60,8 +86,8 @@ const tronWeb = new TronWeb({
   headers: { 'TRON-PRO-API-KEY': TRONGRID_API_KEY }
 });
 
-// BSC provider with rotation (let so we can replace provider on errors)
-let bscProvider = new ethers.providers.JsonRpcProvider(getRandomBscRpc());
+// BSC provider with rotation
+let bscProvider = new ethers.providers.JsonRpcProvider(getHealthyBscRpc());
 
 app.use(express.json());
 app.use((req, res, next) => {
@@ -89,7 +115,11 @@ const FUND_BNB_AMOUNT = 0.01;
 
 // Throttling / concurrency
 const BALANCE_CONCURRENCY = Number(process.env.BALANCE_CONCURRENCY || 2);
-const CHECK_INTERVAL_MS = Number(process.env.CHECK_INTERVAL_MS || 3 * 60 * 1000);
+const CHECK_INTERVAL_MS = Number(process.env.CHECK_INTERVAL_MS || 5 * 60 * 1000);
+
+// Кэш для балансов (5 минут)
+const balanceCache = new Map();
+const CACHE_TTL = 5 * 60 * 1000;
 
 // ========== HELPERS ==========
 function sleep(ms) {
@@ -202,7 +232,136 @@ async function getBSCUSDTBalance(address) {
   }
 }
 
-// Improved getBSCTransactions: Etherscan V2 (chainid=56) first, then chunked RPC fallback with rotation
+async function getCachedBSCUSDTBalance(address) {
+  const cacheKey = `bsc_usdt_${address}`;
+  const cached = balanceCache.get(cacheKey);
+  
+  if (cached && (Date.now() - cached.timestamp < CACHE_TTL)) {
+    return cached.balance;
+  }
+  
+  const balance = await getBSCUSDTBalance(address);
+  balanceCache.set(cacheKey, { balance, timestamp: Date.now() });
+  return balance;
+}
+
+// Улучшенный RPC fallback с адаптивными чанками
+async function getBSCTransactionsRpcFallback(address) {
+  const transactions = [];
+  
+  try {
+    let latestBlock;
+    let currentRpc = getHealthyBscRpc();
+    
+    // Получаем последний блок с ротацией при ошибках
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        bscProvider = new ethers.providers.JsonRpcProvider(currentRpc);
+        latestBlock = await bscProvider.getBlockNumber();
+        break;
+      } catch (e) {
+        console.warn(`⚠️ Failed to get block from ${currentRpc}: ${e.message}`);
+        markRpcUnhealthy(currentRpc);
+        currentRpc = getHealthyBscRpc();
+        await sleep(1000 * (attempt + 1));
+      }
+    }
+    
+    if (!latestBlock) {
+      console.error('❌ Failed to get latest block from all RPCs');
+      return [];
+    }
+
+    const blocksRange = Number(process.env.BSC_SCAN_BLOCKS || 2000);
+    const fromBlock = Math.max(latestBlock - blocksRange, 0);
+    const toBlock = latestBlock;
+    
+    let CHUNK_SIZE = Number(process.env.BSC_CHUNK_SIZE || 500);
+
+    console.log(`📦 Scanning blocks ${fromBlock} to ${toBlock} with chunk size ${CHUNK_SIZE}`);
+
+    const filterTopic0 = ethers.utils.id('Transfer(address,address,uint256)');
+    
+    for (let start = fromBlock; start <= toBlock; start += CHUNK_SIZE) {
+      const end = Math.min(start + CHUNK_SIZE - 1, toBlock);
+      
+      let events = null;
+      let chunkAttempts = 0;
+      const maxChunkAttempts = 3;
+      
+      while (chunkAttempts < maxChunkAttempts) {
+        try {
+          const toTopic = '0x' + padTo32Bytes(strip0x(address));
+          const filter = {
+            address: USDT_BSC_CONTRACT,
+            fromBlock: start,
+            toBlock: end,
+            topics: [filterTopic0, null, toTopic]
+          };
+
+          events = await bscProvider.getLogs(filter);
+          break;
+        } catch (err) {
+          chunkAttempts++;
+          
+          if (err.message && err.message.includes('limit exceeded')) {
+            console.warn(`⚠️ Rate limit on chunk ${start}-${end}, reducing chunk size...`);
+            CHUNK_SIZE = Math.max(100, Math.floor(CHUNK_SIZE * 0.7));
+            markRpcUnhealthy(currentRpc);
+            currentRpc = getHealthyBscRpc();
+            bscProvider = new ethers.providers.JsonRpcProvider(currentRpc);
+          }
+          
+          console.warn(`⚠️ Chunk ${start}-${end} attempt ${chunkAttempts} failed: ${err.message}`);
+          
+          if (chunkAttempts >= maxChunkAttempts) {
+            console.warn(`❌ Chunk ${start}-${end} failed after ${maxChunkAttempts} attempts, skipping`);
+            break;
+          }
+          
+          const backoff = 1000 * Math.pow(2, chunkAttempts);
+          await sleep(backoff);
+        }
+      }
+
+      if (events) {
+        for (const ev of events) {
+          try {
+            const from = '0x' + ev.topics[1].slice(26);
+            const to = '0x' + ev.topics[2].slice(26);
+            const valueBn = ethers.BigNumber.from(ev.data);
+            const amount = Number(ethers.utils.formatUnits(valueBn, 6));
+
+            if (to.toLowerCase() === address.toLowerCase()) {
+              transactions.push({
+                transaction_id: ev.transactionHash,
+                to,
+                from,
+                amount,
+                token: 'USDT',
+                confirmed: true,
+                network: 'BEP20'
+              });
+            }
+          } catch (inner) {
+            continue;
+          }
+        }
+      }
+      
+      await sleep(500);
+    }
+
+    console.log(`✅ RPC fallback found ${transactions.length} transactions for ${address}`);
+    return transactions;
+
+  } catch (error) {
+    console.error('❌ RPC fallback fatal error:', error.message);
+    return [];
+  }
+}
+
+// Improved getBSCTransactions: Etherscan V2 first, then improved RPC fallback
 async function getBSCTransactions(address) {
   try {
     if (!address) return [];
@@ -216,132 +375,57 @@ async function getBSCTransactions(address) {
         address: address,
         contractaddress: USDT_BSC_CONTRACT,
         page: '1',
-        offset: '50',
+        offset: '100',
         sort: 'desc',
         apikey: ETHERSCAN_API_KEY
       });
 
-      const response = await fetch(`${ETHERSCAN_API_URL}?${params}`);
-      const data = await response.json();
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 10000);
 
-      if (data && (data.status === '1' && Array.isArray(data.result))) {
-        console.log(`✅ Etherscan V2: Found ${data.result.length} transactions for ${address}`);
-        const transactions = [];
-        for (const tx of data.result) {
-          try {
-            if (tx.to && tx.to.toLowerCase() === address.toLowerCase() &&
-                tx.contractAddress && tx.contractAddress.toLowerCase() === USDT_BSC_CONTRACT.toLowerCase()) {
-              transactions.push({
-                transaction_id: tx.hash,
-                to: tx.to,
-                from: tx.from,
-                amount: Number(tx.value) / 1e6,
-                token: 'USDT',
-                confirmed: tx.confirmations ? Number(tx.confirmations) > 0 : true,
-                network: 'BEP20'
-              });
-            }
-          } catch (e) { continue; }
+      const response = await fetch(`${ETHERSCAN_API_URL}?${params}`, {
+        signal: controller.signal
+      });
+      
+      clearTimeout(timeoutId);
+
+      if (response.ok) {
+        const data = await response.json();
+
+        if (data && data.status === '1' && Array.isArray(data.result)) {
+          console.log(`✅ Etherscan V2: Found ${data.result.length} transactions for ${address}`);
+          const transactions = [];
+          for (const tx of data.result) {
+            try {
+              if (tx.to && tx.to.toLowerCase() === address.toLowerCase() &&
+                  tx.contractAddress && tx.contractAddress.toLowerCase() === USDT_BSC_CONTRACT.toLowerCase()) {
+                transactions.push({
+                  transaction_id: tx.hash,
+                  to: tx.to,
+                  from: tx.from,
+                  amount: Number(tx.value) / 1e6,
+                  token: 'USDT',
+                  confirmed: tx.confirmations ? Number(tx.confirmations) > 0 : true,
+                  network: 'BEP20'
+                });
+              }
+            } catch (e) { continue; }
+          }
+          return transactions;
+        } else {
+          console.log(`⚠️ Etherscan V2 returned: ${data.message || 'empty/NOTOK'}`);
         }
-        return transactions;
-      } else {
-        console.log(`⚠️ Etherscan V2 returned: ${data.message || 'empty/NOTOK'}`);
       }
     } catch (apiError) {
       console.log(`⚠️ Etherscan V2 failed: ${apiError.message}`);
     }
 
-    // 2) RPC fallback with chunked getLogs + rotation/backoff
-    console.log(`🔄 Using RPC fallback (chunked) for BSC transactions: ${address}`);
-
-    let latestBlock;
-    try {
-      latestBlock = await bscProvider.getBlockNumber();
-    } catch (e) {
-      // try rotating provider once
-      const rpc = getRandomBscRpc();
-      bscProvider = new ethers.providers.JsonRpcProvider(rpc);
-      latestBlock = await bscProvider.getBlockNumber();
-    }
-
-    const blocksRange = Number(process.env.BSC_SCAN_BLOCKS || 4000);
-    const fromBlock = Math.max(latestBlock - blocksRange, 0);
-    const toBlock = latestBlock;
-    const CHUNK_SIZE = Number(process.env.BSC_CHUNK_SIZE || 800);
-
-    const filterTopic0 = ethers.utils.id('Transfer(address,address,uint256)');
-    const transactions = [];
-
-    for (let start = fromBlock; start <= toBlock; start += CHUNK_SIZE) {
-      const end = Math.min(start + CHUNK_SIZE - 1, toBlock);
-
-      let attempts = 0;
-      const maxAttempts = 4;
-      let events = null;
-
-      while (attempts < maxAttempts) {
-        try {
-          const toTopic = '0x' + padTo32Bytes(strip0x(address));
-          const filter = {
-            address: USDT_BSC_CONTRACT,
-            fromBlock: ethers.BigNumber.from(start).toHexString(),
-            toBlock: ethers.BigNumber.from(end).toHexString(),
-            topics: [filterTopic0, null, toTopic]
-          };
-
-          events = await bscProvider.getLogs(filter);
-          break; // success
-        } catch (err) {
-          attempts++;
-          console.warn(`⚠️ getLogs chunk ${start}-${end} attempt ${attempts} failed: ${err && err.message}`);
-          // rotate RPC and backoff
-          const rpc = getRandomBscRpc();
-          try {
-            bscProvider = new ethers.providers.JsonRpcProvider(rpc);
-            console.log(`🔁 Rotated RPC to ${rpc}`);
-          } catch (rotErr) {
-            console.warn('RPC rotate failed:', rotErr && rotErr.message);
-          }
-          const backoff = 500 * Math.pow(2, attempts);
-          await sleep(backoff);
-        }
-      }
-
-      if (!events) {
-        console.warn(`❌ Chunk ${start}-${end} failed completely; skipping`);
-        continue;
-      }
-
-      for (const ev of events) {
-        try {
-          // topics[1] = from, topics[2] = to (32-byte hex)
-          const from = '0x' + ev.topics[1].slice(26);
-          const to = '0x' + ev.topics[2].slice(26);
-          const valueBn = ethers.BigNumber.from(ev.data);
-          const amount = Number(ethers.utils.formatUnits(valueBn, 6));
-
-          if (to.toLowerCase() === address.toLowerCase()) {
-            transactions.push({
-              transaction_id: ev.transactionHash,
-              to,
-              from,
-              amount,
-              token: 'USDT',
-              confirmed: true,
-              network: 'BEP20'
-            });
-          }
-        } catch (inner) {
-          continue;
-        }
-      }
-    }
-
-    console.log(`✅ RPC fallback (chunked) found ${transactions.length} transactions for ${address}`);
-    return transactions;
-
+    // 2) Improved RPC fallback with adaptive chunks
+    console.log(`🔄 Using improved RPC fallback for BSC transactions: ${address}`);
+    return await getBSCTransactionsRpcFallback(address);
+    
   } catch (error) {
-    console.error('❌ BSC transactions error:', error && error.message ? error.message : error);
+    console.error('❌ BSC transactions error:', error.message);
     return [];
   }
 }
@@ -619,7 +703,7 @@ async function autoCollectToMainWallet(wallet) {
       transferFunction = transferUSDT;
       sendNativeFunction = sendTRX;
     } else if (wallet.network === 'BEP20') {
-      usdtBalance = await getBSCUSDTBalance(wallet.address);
+      usdtBalance = await getCachedBSCUSDTBalance(wallet.address);
       nativeBalance = await getBSCBalance(wallet.address);
       minNativeForFee = MIN_BNB_FOR_FEE;
       fundAmount = FUND_BNB_AMOUNT;
@@ -881,26 +965,19 @@ async function handleCheckDeposits(req = {}, res = {}) {
     if (error) throw error;
 
     console.log(`🔍 Checking ${wallets?.length || 0} wallets across all networks`);
+    
+    const bscWallets = wallets.filter(w => w.network === 'BEP20');
+    const trcWallets = wallets.filter(w => w.network === 'TRC20');
+    
     let processedCount = 0;
     let depositsFound = 0;
     let duplicatesSkipped = 0;
 
-    for (const wallet of wallets || []) {
+    // Process TRC20 wallets first (faster)
+    for (const wallet of trcWallets) {
       try {
-        if (wallet.network === 'BEP20') {
-          await sleep(3000); // 3 секунды для BSC кошельков
-        } else {
-          await sleep(200); // 200ms для TRC20
-        }
-        
-        let transactions = [];
-
-        if (wallet.network === 'TRC20') {
-          transactions = await getUSDTTransactions(wallet.address);
-        } else if (wallet.network === 'BEP20') {
-          transactions = await getBSCTransactions(wallet.address);
-        }
-
+        await sleep(200);
+        const transactions = await getUSDTTransactions(wallet.address);
         for (const tx of transactions) {
           const recipient = wallet.network === 'TRC20' ? tx.to : tx.to.toLowerCase();
           const walletAddress = wallet.network === 'TRC20' ? wallet.address : wallet.address.toLowerCase();
@@ -918,11 +995,39 @@ async function handleCheckDeposits(req = {}, res = {}) {
             }
           }
         }
-
         await supabase.from('user_wallets').update({ last_checked: new Date().toISOString() }).eq('id', wallet.id);
         processedCount++;
       } catch (err) {
-        console.error(`❌ Error processing wallet ${wallet.address}:`, err.message);
+        console.error(`❌ Error processing TRC20 wallet ${wallet.address}:`, err.message);
+      }
+    }
+
+    // Then process BSC wallets (slower but with API priority)
+    for (const wallet of bscWallets) {
+      try {
+        await sleep(3000);
+        const transactions = await getBSCTransactions(wallet.address);
+        for (const tx of transactions) {
+          const recipient = wallet.network === 'TRC20' ? tx.to : tx.to.toLowerCase();
+          const walletAddress = wallet.network === 'TRC20' ? wallet.address : wallet.address.toLowerCase();
+          
+          if (recipient === walletAddress && tx.token === 'USDT' && tx.amount >= MIN_DEPOSIT) {
+            try {
+              const result = await processDeposit(wallet, tx.amount, tx.transaction_id, wallet.network);
+              if (result.success) {
+                depositsFound++;
+              } else if (result.reason === 'already_processed' || result.reason === 'concurrent_processing') {
+                duplicatesSkipped++;
+              }
+            } catch (err) {
+              console.error(`❌ Error processing deposit ${tx.transaction_id}:`, err.message);
+            }
+          }
+        }
+        await supabase.from('user_wallets').update({ last_checked: new Date().toISOString() }).eq('id', wallet.id);
+        processedCount++;
+      } catch (err) {
+        console.error(`❌ Error processing BSC wallet ${wallet.address}:`, err.message);
       }
     }
 
@@ -1042,7 +1147,7 @@ async function checkUserDeposits(userId, network) {
 app.get('/', (req, res) => {
   res.json({
     status: '✅ WORKING',
-    message: 'Tron & BSC Wallet System - MULTI-NETWORK',
+    message: 'Tron & BSC Wallet System - IMPROVED BSC RPC HANDLING',
     timestamp: new Date().toISOString(),
     networks: ['TRC20', 'BEP20'],
     features: [
@@ -1053,7 +1158,10 @@ app.get('/', (req, res) => {
       'Gas Management (TRX/BNB)',
       'USDT Transfers',
       'DUPLICATE PROTECTION',
-      'Etherscan API V2 Integration'
+      'Etherscan API V2 Integration',
+      'IMPROVED BSC RPC HEALTH CHECKING',
+      'ADAPTIVE CHUNK SIZING',
+      'RPC ROTATION WITH BACKOFF'
     ]
   });
 });
@@ -1073,7 +1181,7 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`🚀 SERVER RUNNING on port ${PORT}`);
   console.log(`✅ SUPABASE: ${SUPABASE_URL ? 'CONNECTED' : 'MISSING'}`);
   console.log(`✅ TRONGRID: API KEY ${TRONGRID_API_KEY ? 'SET' : 'MISSING'}`);
-  console.log(`✅ BSC RPC: MULTI-PROVIDER WITH ROTATION`);
+  console.log(`✅ BSC RPC: ${BSC_RPC_URLS.length} PROVIDERS WITH HEALTH CHECKING`);
   console.log(`✅ ETHERSCAN API V2: KEY SET (${ETHERSCAN_API_KEY.substring(0, 8)}...)`);
   console.log(`💰 TRC20 MASTER: ${COMPANY.MASTER.address}`);
   console.log(`💰 TRC20 MAIN: ${COMPANY.MAIN.address}`);
