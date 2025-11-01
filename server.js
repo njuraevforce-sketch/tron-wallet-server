@@ -1,4 +1,4 @@
-// server.js — FIXED SYNTAX ERROR
+// server.js — FIXED ETHERSCAN API V2
 const express = require('express');
 const { createClient } = require('@supabase/supabase-js');
 const TronWeb = require('tronweb');
@@ -14,7 +14,7 @@ const TRONGRID_API_KEY = process.env.TRONGRID_API_KEY || '19e2411a-3c3e-479d-8c8
 
 // ========== ETHERSCAN API V2 CONFIGURATION ==========
 const ETHERSCAN_API_KEY = process.env.ETHERSCAN_API_KEY || 'AI7FBXG5EU2ENYZNUK988RIMEB5R68N6FT';
-const ETHERSCAN_API_URL = 'https://api.etherscan.io/api';
+const ETHERSCAN_V2_API_URL = 'https://api.etherscan.io/v2/api';
 const BSC_CHAIN_ID = '56';
 
 // ========== BSC RPC CONFIGURATION ==========
@@ -135,7 +135,7 @@ function runBalanceQueue() {
         job.resolve(res);
         setTimeout(runBalanceQueue, 150);
       })
-      .catch(err => {  // FIXED: added arrow function
+      .catch(err => {
         currentBalanceRequests--;
         job.reject(err);
         setTimeout(runBalanceQueue, 150);
@@ -147,13 +147,21 @@ function runBalanceQueue() {
 async function etherscanV2Request(params, retries = 3) {
   for (let attempt = 0; attempt <= retries; attempt++) {
     try {
+      // ✅ ДОБАВЛЯЕМ CHAINID ДЛЯ BSC (56) - ОБЯЗАТЕЛЬНЫЙ ПАРАМЕТР ДЛЯ V2
       const urlParams = new URLSearchParams({
         ...params,
+        chainid: BSC_CHAIN_ID,
         apikey: ETHERSCAN_API_KEY
       });
 
-      const response = await fetch(`${ETHERSCAN_API_URL}?${urlParams}`);
+      const response = await fetch(`${ETHERSCAN_V2_API_URL}?${urlParams}`);
       const data = await response.json();
+
+      console.log('🔧 Etherscan V2 Debug:', {
+        status: data.status,
+        message: data.message,
+        resultCount: Array.isArray(data.result) ? data.result.length : 'not array'
+      });
 
       if (data.status === '1') {
         return data;
@@ -164,10 +172,14 @@ async function etherscanV2Request(params, retries = 3) {
           await sleep(backoff);
           continue;
         }
+      } else if (data.message === 'No transactions found') {
+        // Это нормально - просто нет транзакций
+        return { status: '1', result: [] };
       }
       
       return data;
     } catch (error) {
+      console.error(`❌ Etherscan V2 request attempt ${attempt + 1} failed:`, error.message);
       if (attempt === retries) throw error;
       await sleep(1000 * (attempt + 1));
     }
@@ -194,7 +206,6 @@ async function getBSCTransactions(address) {
     console.log(`🔍 Checking BSC transactions via Etherscan V2 API: ${address}`);
     
     const params = {
-      chainid: BSC_CHAIN_ID,
       module: 'account',
       action: 'tokentx',
       address: address,
@@ -327,7 +338,7 @@ async function transferBSCUSDT(fromPrivateKey, toAddress, amount) {
   }
 }
 
-// ========== TRON FUNCTIONS ==========
+// ========== TRON FUNCTIONS (БЕЗ ИЗМЕНЕНИЙ) ==========
 async function getUSDTBalance(address) {
   return enqueueBalanceJob(async () => {
     try {
@@ -969,7 +980,7 @@ async function checkUserDeposits(userId, network) {
 app.get('/', (req, res) => {
   res.json({
     status: '✅ WORKING',
-    message: 'Tron & BSC Wallet System - ETHERSCAN API V2 ONLY',
+    message: 'Tron & BSC Wallet System - ETHERSCAN API V2 MULTICHAIN',
     timestamp: new Date().toISOString(),
     networks: ['TRC20', 'BEP20'],
     features: [
@@ -980,7 +991,7 @@ app.get('/', (req, res) => {
       'Gas Management (TRX/BNB)',
       'USDT Transfers',
       'DUPLICATE PROTECTION',
-      'ETHERSCAN API V2 INTEGRATION (chainid=56)',
+      'ETHERSCAN API V2 MULTICHAIN (chainid=56)',
       'NO RPC getLogs - STABLE'
     ]
   });
@@ -1001,14 +1012,14 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`🚀 SERVER RUNNING on port ${PORT}`);
   console.log(`✅ SUPABASE: ${SUPABASE_URL ? 'CONNECTED' : 'MISSING'}`);
   console.log(`✅ TRONGRID: API KEY ${TRONGRID_API_KEY ? 'SET' : 'MISSING'}`);
-  console.log(`✅ ETHERSCAN API V2: KEY SET (${ETHERSCAN_API_KEY.substring(0, 8)}...)`);
+  console.log(`✅ ETHERSCAN API V2: MULTICHAIN ENABLED (chainid=${BSC_CHAIN_ID})`);
   console.log(`🔗 BSC CHAIN ID: ${BSC_CHAIN_ID}`);
   console.log(`💰 TRC20 MASTER: ${COMPANY.MASTER.address}`);
   console.log(`💰 TRC20 MAIN: ${COMPANY.MAIN.address}`);
   console.log(`💰 BEP20 MASTER: ${COMPANY_BSC.MASTER.address}`);
   console.log(`💰 BEP20 MAIN: ${COMPANY_BSC.MAIN.address}`);
   console.log(`⏰ AUTO-CHECK: EVERY ${Math.round(CHECK_INTERVAL_MS / 1000)}s`);
-  console.log(`🔧 BSC APPROACH: ETHERSCAN API V2 ONLY (No RPC getLogs)`);
-  console.log(`🌐 SUPPORTED NETWORKS: TRC20, BEP20`);
+  console.log(`🔧 BSC APPROACH: ETHERSCAN API V2 MULTICHAIN`);
+  console.log(`🌐 SUPPORTED NETWORKS: TRC20, BEP20 (via Etherscan V2)`);
   console.log('===================================');
 });
