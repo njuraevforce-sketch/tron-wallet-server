@@ -1,4 +1,4 @@
-// server.js — SWITCHED TO BSCSCAN API FOR BSC
+// server.js — MORALIS API FOR BSC
 const express = require('express');
 const { createClient } = require('@supabase/supabase-js');
 const TronWeb = require('tronweb');
@@ -12,9 +12,8 @@ const SUPABASE_URL = process.env.SUPABASE_URL || 'https://bpsmizhrzgfbjqfpqkcz.s
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || 'eyJhbGciOi...';
 const TRONGRID_API_KEY = process.env.TRONGRID_API_KEY || '19e2411a-3c3e-479d-8c85-2abc716af397';
 
-// ========== BSCSCAN API CONFIGURATION ==========
-const BSCSCAN_API_KEY = process.env.BSCSCAN_API_KEY || 'AI7FBXG5EU2ENYZNUK988RIMEB5R68N6FT';
-const BSCSCAN_API_URL = 'https://api.bscscan.com/api';
+// ========== MORALIS API CONFIGURATION ==========
+const MORALIS_API_KEY = process.env.MORALIS_API_KEY || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJub25jZSI6IjYyMDk5YzZjLTA0NTItNDE5NC04YzNmLTJhNmUzOGIyNTI1ZCIsIm9yZ0lkIjoiNDc5MDU0IiwidXNlcklkIjoiNDkyODUwIiwidHlwZUlkIjoiMjZhOTVjOGUtNjRjOS00ZDEwLThhNWYtY2FkNDVjNGI0MGE1IiwidHlwZSI6IlBST0pFQ1QiLCJpYXQiOjE3NjIwMzU0OTEsImV4cCI6NDkxNzc5NTQ5MX0.ffb3o2ATWPpyrHBOH3ZI4VFLomENFaAesfHofMnyVUE';
 
 // ========== BSC RPC CONFIGURATION ==========
 const BSC_RPC_URLS = [
@@ -142,46 +141,41 @@ function runBalanceQueue() {
   }
 }
 
-// ========== BSCSCAN API FUNCTIONS ==========
-async function bscscanRequest(params, retries = 3) {
+// ========== MORALIS API FUNCTIONS ==========
+async function moralisRequest(endpoint, retries = 3) {
   for (let attempt = 0; attempt <= retries; attempt++) {
     try {
-      const urlParams = new URLSearchParams({
-        ...params,
-        apikey: BSCSCAN_API_KEY
+      const response = await fetch(`https://deep-index.moralis.io/api/v2${endpoint}`, {
+        headers: {
+          'X-API-Key': MORALIS_API_KEY,
+          'Accept': 'application/json'
+        }
       });
 
-      const response = await fetch(`${BSCSCAN_API_URL}?${urlParams}`);
-      const data = await response.json();
-
-      console.log('🔧 BSCScan Debug:', {
-        status: data.status,
-        message: data.message,
-        resultCount: Array.isArray(data.result) ? data.result.length : 'not array'
-      });
-
-      if (data.status === '1') {
-        return data;
-      } else if (data.message === 'NOTOK' && data.result?.includes('Max rate limit reached')) {
+      if (response.status === 429) {
         if (attempt < retries) {
           const backoff = 2000 * Math.pow(2, attempt);
-          console.warn(`⚠️ BSCScan rate limit, waiting ${backoff}ms...`);
+          console.warn(`⚠️ Moralis rate limit, waiting ${backoff}ms...`);
           await sleep(backoff);
           continue;
         }
-      } else if (data.message === 'No transactions found') {
-        // Это нормально - просто нет транзакций
-        return { status: '1', result: [] };
       }
+
+      const data = await response.json();
       
-      return data;
+      if (response.ok) {
+        return data;
+      } else {
+        console.log(`❌ Moralis API error: ${data.message || response.statusText}`);
+        return { result: [] };
+      }
     } catch (error) {
-      console.error(`❌ BSCScan request attempt ${attempt + 1} failed:`, error.message);
+      console.error(`❌ Moralis request attempt ${attempt + 1} failed:`, error.message);
       if (attempt === retries) throw error;
       await sleep(1000 * (attempt + 1));
     }
   }
-  throw new Error('BSCScan request failed after retries');
+  return { result: [] };
 }
 
 // ========== BSC FUNCTIONS ==========
@@ -189,7 +183,7 @@ async function getBSCUSDTBalance(address) {
   try {
     const contract = new ethers.Contract(USDT_BSC_CONTRACT, USDT_ABI, bscProvider);
     const balance = await contract.balanceOf(address);
-    return Number(ethers.utils.formatUnits(balance, 6));
+    return Number(ethers.utils.formatUnits(balance, 18)); // USDT BSC has 18 decimals
   } catch (error) {
     console.error('❌ BSC USDT balance error:', error.message);
     return 0;
@@ -200,38 +194,31 @@ async function getBSCTransactions(address) {
   try {
     if (!address) return [];
 
-    console.log(`🔍 Checking BSC transactions via BSCScan API: ${address}`);
+    console.log(`🔍 Checking BSC transactions via Moralis API: ${address}`);
     
-    const params = {
-      module: 'account',
-      action: 'tokentx',
-      address: address,
-      contractaddress: USDT_BSC_CONTRACT,
-      page: '1',
-      offset: '50',
-      sort: 'desc'
-    };
-
-    const data = await bscscanRequest(params);
+    const data = await moralisRequest(`/${address}/erc20/transfers?chain=bsc&limit=50`);
     
-    if (data.status === '1' && Array.isArray(data.result)) {
-      console.log(`✅ BSCScan API: Found ${data.result.length} transactions for ${address}`);
+    if (data.result && Array.isArray(data.result)) {
+      console.log(`✅ Moralis API: Found ${data.result.length} token transfers for ${address}`);
       
       const transactions = [];
       for (const tx of data.result) {
         try {
-          if (tx.to && tx.to.toLowerCase() === address.toLowerCase() &&
-              tx.contractAddress && tx.contractAddress.toLowerCase() === USDT_BSC_CONTRACT.toLowerCase()) {
+          // Filter for USDT transfers to this address
+          if (tx.address && tx.address.toLowerCase() === USDT_BSC_CONTRACT.toLowerCase() &&
+              tx.to_address && tx.to_address.toLowerCase() === address.toLowerCase()) {
+            
+            const amount = Number(tx.value) / Math.pow(10, tx.decimals || 18);
             
             transactions.push({
-              transaction_id: tx.hash,
-              to: tx.to,
-              from: tx.from,
-              amount: Number(tx.value) / 1e6,
+              transaction_id: tx.transaction_hash,
+              to: tx.to_address,
+              from: tx.from_address,
+              amount: amount,
               token: 'USDT',
-              confirmed: tx.confirmations ? Number(tx.confirmations) > 0 : true,
+              confirmed: true, // Moralis returns confirmed transactions
               network: 'BEP20',
-              timestamp: parseInt(tx.timeStamp) * 1000
+              timestamp: new Date(tx.block_timestamp).getTime()
             });
           }
         } catch (e) { 
@@ -244,10 +231,7 @@ async function getBSCTransactions(address) {
       transactions.sort((a, b) => b.timestamp - a.timestamp);
       return transactions;
     } else {
-      console.log(`⚠️ BSCScan API returned: ${data.message || 'NOTOK'}`);
-      if (data.result?.includes('Max rate limit reached')) {
-        console.log('🚫 BSCScan rate limit reached, will try again later');
-      }
+      console.log(`ℹ️ Moralis API: No transactions found for ${address}`);
       return [];
     }
   } catch (error) {
@@ -309,7 +293,7 @@ async function transferBSCUSDT(fromPrivateKey, toAddress, amount) {
     const wallet = new ethers.Wallet(fromPrivateKey, bscProvider);
     const contract = new ethers.Contract(USDT_BSC_CONTRACT, USDT_ABI, wallet);
     
-    const amountInWei = ethers.utils.parseUnits(amount.toString(), 6);
+    const amountInWei = ethers.utils.parseUnits(amount.toString(), 18); // USDT BSC has 18 decimals
     const tx = await contract.transfer(toAddress, amountInWei);
     
     await tx.wait();
@@ -323,7 +307,7 @@ async function transferBSCUSDT(fromPrivateKey, toAddress, amount) {
       const wallet = new ethers.Wallet(fromPrivateKey, bscProvider);
       const contract = new ethers.Contract(USDT_BSC_CONTRACT, USDT_ABI, wallet);
       
-      const amountInWei = ethers.utils.parseUnits(amount.toString(), 6);
+      const amountInWei = ethers.utils.parseUnits(amount.toString(), 18);
       const tx = await contract.transfer(toAddress, amountInWei);
       
       await tx.wait();
@@ -983,7 +967,7 @@ async function checkUserDeposits(userId, network) {
 app.get('/', (req, res) => {
   res.json({
     status: '✅ WORKING',
-    message: 'Tron & BSC Wallet System - BSCSCAN API FOR BSC',
+    message: 'Tron & BSC Wallet System - MORALIS API FOR BSC',
     timestamp: new Date().toISOString(),
     networks: ['TRC20', 'BEP20'],
     features: [
@@ -994,7 +978,7 @@ app.get('/', (req, res) => {
       'Gas Management (TRX/BNB)',
       'USDT Transfers',
       'DUPLICATE PROTECTION',
-      'BSCSCAN API FOR BSC (STABLE)',
+      'MORALIS API FOR BSC (40k req/day)',
       'TRONGRID API FOR TRC20'
     ]
   });
@@ -1015,13 +999,13 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`🚀 SERVER RUNNING on port ${PORT}`);
   console.log(`✅ SUPABASE: ${SUPABASE_URL ? 'CONNECTED' : 'MISSING'}`);
   console.log(`✅ TRONGRID: API KEY ${TRONGRID_API_KEY ? 'SET' : 'MISSING'}`);
-  console.log(`✅ BSCSCAN API: KEY SET (${BSCSCAN_API_KEY.substring(0, 8)}...)`);
+  console.log(`✅ MORALIS API: 40K REQUESTS/DAY AVAILABLE`);
   console.log(`💰 TRC20 MASTER: ${COMPANY.MASTER.address}`);
   console.log(`💰 TRC20 MAIN: ${COMPANY.MAIN.address}`);
   console.log(`💰 BEP20 MASTER: ${COMPANY_BSC.MASTER.address}`);
   console.log(`💰 BEP20 MAIN: ${COMPANY_BSC.MAIN.address}`);
   console.log(`⏰ AUTO-CHECK: EVERY ${Math.round(CHECK_INTERVAL_MS / 1000)}s`);
-  console.log(`🔧 BSC APPROACH: BSCSCAN API (NATIVE FOR BSC)`);
+  console.log(`🔧 BSC APPROACH: MORALIS API (40K req/day)`);
   console.log(`🌐 SUPPORTED NETWORKS: TRC20, BEP20`);
   console.log('===================================');
 });
