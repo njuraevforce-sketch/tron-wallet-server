@@ -1,4 +1,4 @@
-// server.js — FIXED ETHERSCAN API V2
+// server.js — FIXED ETHERSCAN API V2 WITH RATE LIMITING
 const express = require('express');
 const { createClient } = require('@supabase/supabase-js');
 const TronWeb = require('tronweb');
@@ -16,6 +16,10 @@ const TRONGRID_API_KEY = process.env.TRONGRID_API_KEY || '19e2411a-3c3e-479d-8c8
 const ETHERSCAN_API_KEY = process.env.ETHERSCAN_API_KEY || 'AI7FBXG5EU2ENYZNUK988RIMEB5R68N6FT';
 const ETHERSCAN_V2_API_URL = 'https://api.etherscan.io/v2/api';
 const BSC_CHAIN_ID = '56';
+
+// Rate limiting variables
+let lastEtherscanCall = 0;
+const ETHERSCAN_RATE_LIMIT_MS = 250; // 4 запроса в секунду (1000/4 = 250ms) - оставляем запас
 
 // ========== BSC RPC CONFIGURATION ==========
 const BSC_RPC_URLS = [
@@ -145,9 +149,20 @@ function runBalanceQueue() {
 
 // ========== ETHERSCAN API V2 FUNCTIONS ==========
 async function etherscanV2Request(params, retries = 3) {
+  // Rate limiting - соблюдаем 5 запросов в секунду
+  const now = Date.now();
+  const timeSinceLastCall = now - lastEtherscanCall;
+  
+  if (timeSinceLastCall < ETHERSCAN_RATE_LIMIT_MS) {
+    const waitTime = ETHERSCAN_RATE_LIMIT_MS - timeSinceLastCall;
+    console.log(`⏳ Rate limiting: waiting ${waitTime}ms before next Etherscan call...`);
+    await sleep(waitTime);
+  }
+  
   for (let attempt = 0; attempt <= retries; attempt++) {
     try {
-      // ✅ ДОБАВЛЯЕМ CHAINID ДЛЯ BSC (56) - ОБЯЗАТЕЛЬНЫЙ ПАРАМЕТР ДЛЯ V2
+      lastEtherscanCall = Date.now();
+      
       const urlParams = new URLSearchParams({
         ...params,
         chainid: BSC_CHAIN_ID,
@@ -824,11 +839,11 @@ async function handleCheckDeposits(req = {}, res = {}) {
 
     for (const wallet of wallets || []) {
       try {
-        // Add delay between wallet checks to avoid rate limits
+        // УВЕЛИЧИМ ЗАДЕРЖКИ ДЛЯ СОБЛЮДЕНИЯ RATE LIMITS
         if (wallet.network === 'BEP20') {
-          await sleep(3000); // 3 seconds for BSC (Etherscan V2 rate limits)
+          await sleep(500); // 500ms для BSC (Etherscan V2 rate limits)
         } else {
-          await sleep(1000); // 1 second for TRC20
+          await sleep(1000); // 1 second для TRC20
         }
         
         let transactions = [];
@@ -946,6 +961,12 @@ async function checkUserDeposits(userId, network) {
     if (!wallet) return;
     
     console.log(`🔍 Checking ${network} deposits for user ${userId}, wallet: ${wallet.address}`);
+    
+    // ДОБАВИМ ЗАДЕРЖКУ ДЛЯ BEP20
+    if (network === 'BEP20') {
+      await sleep(500);
+    }
+    
     let transactions = [];
 
     if (network === 'TRC20') {
@@ -992,7 +1013,7 @@ app.get('/', (req, res) => {
       'USDT Transfers',
       'DUPLICATE PROTECTION',
       'ETHERSCAN API V2 MULTICHAIN (chainid=56)',
-      'NO RPC getLogs - STABLE'
+      'RATE LIMITING: 4 req/sec with 250ms delays'
     ]
   });
 });
@@ -1020,6 +1041,7 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`💰 BEP20 MAIN: ${COMPANY_BSC.MAIN.address}`);
   console.log(`⏰ AUTO-CHECK: EVERY ${Math.round(CHECK_INTERVAL_MS / 1000)}s`);
   console.log(`🔧 BSC APPROACH: ETHERSCAN API V2 MULTICHAIN`);
+  console.log(`⏳ RATE LIMITING: 250ms between Etherscan calls (4 req/sec)`);
   console.log(`🌐 SUPPORTED NETWORKS: TRC20, BEP20 (via Etherscan V2)`);
   console.log('===================================');
 });
