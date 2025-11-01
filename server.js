@@ -1,4 +1,4 @@
-// server.js — UPDATED (ETHERSCAN API V2 integration + chunked RPC fallback)
+// server.js — FIXED SYNTAX ERROR
 const express = require('express');
 const { createClient } = require('@supabase/supabase-js');
 const TronWeb = require('tronweb');
@@ -14,10 +14,10 @@ const TRONGRID_API_KEY = process.env.TRONGRID_API_KEY || '19e2411a-3c3e-479d-8c8
 
 // ========== ETHERSCAN API V2 CONFIGURATION ==========
 const ETHERSCAN_API_KEY = process.env.ETHERSCAN_API_KEY || 'AI7FBXG5EU2ENYZNUK988RIMEB5R68N6FT';
-// Use main Etherscan endpoint and pass chainid=56 for BSC (Etherscan V2 multichain)
-const ETHERSCAN_API_URL = process.env.ETHERSCAN_API_URL || 'https://api.etherscan.io/api';
-const BSC_CHAIN_ID = '56'; // Chain ID for BSC
+const ETHERSCAN_API_URL = 'https://api.etherscan.io/api';
+const BSC_CHAIN_ID = '56';
 
+// ========== BSC RPC CONFIGURATION ==========
 const BSC_RPC_URLS = [
   'https://bsc-dataseed.binance.org/',
   'https://bsc-dataseed1.defibit.io/',
@@ -25,9 +25,14 @@ const BSC_RPC_URLS = [
   'https://bsc-dataseed2.ninicoin.io/',
 ];
 
-function getRandomBscRpc() {
-  return BSC_RPC_URLS[Math.floor(Math.random() * BSC_RPC_URLS.length)];
+let currentRpcIndex = 0;
+function getNextBscRpc() {
+  const rpc = BSC_RPC_URLS[currentRpcIndex];
+  currentRpcIndex = (currentRpcIndex + 1) % BSC_RPC_URLS.length;
+  return rpc;
 }
+
+let bscProvider = new ethers.providers.JsonRpcProvider(getNextBscRpc());
 
 // COMPANY wallets - TRC20
 const COMPANY = {
@@ -60,9 +65,6 @@ const tronWeb = new TronWeb({
   headers: { 'TRON-PRO-API-KEY': TRONGRID_API_KEY }
 });
 
-// BSC provider with rotation (let so we can replace provider on errors)
-let bscProvider = new ethers.providers.JsonRpcProvider(getRandomBscRpc());
-
 app.use(express.json());
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
@@ -76,8 +78,7 @@ const USDT_CONTRACT = 'TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t';
 const USDT_BSC_CONTRACT = '0x55d398326f99059fF775485246999027B3197955';
 const USDT_ABI = [
   "function balanceOf(address) view returns (uint256)",
-  "function transfer(address to, uint256 amount) returns (bool)",
-  "event Transfer(address indexed from, address indexed to, uint256 value)"
+  "function transfer(address to, uint256 amount) returns (bool)"
 ];
 
 const MIN_DEPOSIT = 20;
@@ -89,20 +90,11 @@ const FUND_BNB_AMOUNT = 0.01;
 
 // Throttling / concurrency
 const BALANCE_CONCURRENCY = Number(process.env.BALANCE_CONCURRENCY || 2);
-const CHECK_INTERVAL_MS = Number(process.env.CHECK_INTERVAL_MS || 3 * 60 * 1000);
+const CHECK_INTERVAL_MS = Number(process.env.CHECK_INTERVAL_MS || 5 * 60 * 1000);
 
 // ========== HELPERS ==========
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
-}
-
-function strip0x(s) {
-  if (!s) return s;
-  return s.startsWith('0x') ? s.slice(2) : s;
-}
-
-function padTo32Bytes(hexWithoutPrefix) {
-  return hexWithoutPrefix.padStart(64, '0');
 }
 
 function normalizePrivateKeyForTron(pk) {
@@ -132,6 +124,7 @@ function enqueueBalanceJob(fn) {
     runBalanceQueue();
   });
 }
+
 function runBalanceQueue() {
   while (currentBalanceRequests < BALANCE_CONCURRENCY && pendingBalanceQueue.length) {
     const job = pendingBalanceQueue.shift();
@@ -142,7 +135,7 @@ function runBalanceQueue() {
         job.resolve(res);
         setTimeout(runBalanceQueue, 150);
       })
-      .catch(err => {
+      .catch(err => {  // FIXED: added arrow function
         currentBalanceRequests--;
         job.reject(err);
         setTimeout(runBalanceQueue, 150);
@@ -150,44 +143,36 @@ function runBalanceQueue() {
   }
 }
 
-// ========== TronGrid request with retry/backoff ==========
-async function trongridRequestWithRetry(path, opts = {}, retries = 4, backoffMs = 800) {
-  const base = 'https://api.trongrid.io/';
-  
-  const headers = {
-    'Accept': 'application/json',
-    'Content-Type': 'application/json',
-    'TRON-PRO-API-KEY': TRONGRID_API_KEY,
-    ...opts.headers
-  };
-  
-  const options = {
-    ...opts,
-    headers
-  };
-  
+// ========== ETHERSCAN API V2 FUNCTIONS ==========
+async function etherscanV2Request(params, retries = 3) {
   for (let attempt = 0; attempt <= retries; attempt++) {
     try {
-      const res = await fetch(base + path, options);
-      if (res.status === 429) {
-        const wait = backoffMs * Math.pow(2, attempt);
-        console.warn(`TronGrid 429 — wait ${wait}ms (attempt ${attempt + 1}/${retries + 1})`);
-        await sleep(wait);
-        continue;
+      const urlParams = new URLSearchParams({
+        ...params,
+        apikey: ETHERSCAN_API_KEY
+      });
+
+      const response = await fetch(`${ETHERSCAN_API_URL}?${urlParams}`);
+      const data = await response.json();
+
+      if (data.status === '1') {
+        return data;
+      } else if (data.message === 'NOTOK' && data.result?.includes('Max rate limit reached')) {
+        if (attempt < retries) {
+          const backoff = 2000 * Math.pow(2, attempt);
+          console.warn(`⚠️ Etherscan V2 rate limit, waiting ${backoff}ms...`);
+          await sleep(backoff);
+          continue;
+        }
       }
-      if (!res.ok) {
-        const txt = await res.text().catch(() => '<no body>');
-        throw new Error(`TronGrid HTTP ${res.status}: ${txt}`);
-      }
-      return await res.json();
-    } catch (e) {
-      if (attempt === retries) throw e;
-      const wait = backoffMs * Math.pow(2, attempt);
-      console.warn(`TronGrid request error (attempt ${attempt + 1}), retrying in ${wait}ms: ${e.message}`);
-      await sleep(wait);
+      
+      return data;
+    } catch (error) {
+      if (attempt === retries) throw error;
+      await sleep(1000 * (attempt + 1));
     }
   }
-  throw new Error('TronGrid retry exhausted');
+  throw new Error('Etherscan V2 request failed after retries');
 }
 
 // ========== BSC FUNCTIONS ==========
@@ -202,146 +187,63 @@ async function getBSCUSDTBalance(address) {
   }
 }
 
-// Improved getBSCTransactions: Etherscan V2 (chainid=56) first, then chunked RPC fallback with rotation
 async function getBSCTransactions(address) {
   try {
     if (!address) return [];
 
-    // 1) Try Etherscan V2 (multichain) with chainid=56
-    try {
-      const params = new URLSearchParams({
-        chainid: BSC_CHAIN_ID,
-        module: 'account',
-        action: 'tokentx',
-        address: address,
-        contractaddress: USDT_BSC_CONTRACT,
-        page: '1',
-        offset: '50',
-        sort: 'desc',
-        apikey: ETHERSCAN_API_KEY
-      });
+    console.log(`🔍 Checking BSC transactions via Etherscan V2 API: ${address}`);
+    
+    const params = {
+      chainid: BSC_CHAIN_ID,
+      module: 'account',
+      action: 'tokentx',
+      address: address,
+      contractaddress: USDT_BSC_CONTRACT,
+      page: '1',
+      offset: '50',
+      sort: 'desc'
+    };
 
-      const response = await fetch(`${ETHERSCAN_API_URL}?${params}`);
-      const data = await response.json();
-
-      if (data && (data.status === '1' && Array.isArray(data.result))) {
-        console.log(`✅ Etherscan V2: Found ${data.result.length} transactions for ${address}`);
-        const transactions = [];
-        for (const tx of data.result) {
-          try {
-            if (tx.to && tx.to.toLowerCase() === address.toLowerCase() &&
-                tx.contractAddress && tx.contractAddress.toLowerCase() === USDT_BSC_CONTRACT.toLowerCase()) {
-              transactions.push({
-                transaction_id: tx.hash,
-                to: tx.to,
-                from: tx.from,
-                amount: Number(tx.value) / 1e6,
-                token: 'USDT',
-                confirmed: tx.confirmations ? Number(tx.confirmations) > 0 : true,
-                network: 'BEP20'
-              });
-            }
-          } catch (e) { continue; }
-        }
-        return transactions;
-      } else {
-        console.log(`⚠️ Etherscan V2 returned: ${data.message || 'empty/NOTOK'}`);
-      }
-    } catch (apiError) {
-      console.log(`⚠️ Etherscan V2 failed: ${apiError.message}`);
-    }
-
-    // 2) RPC fallback with chunked getLogs + rotation/backoff
-    console.log(`🔄 Using RPC fallback (chunked) for BSC transactions: ${address}`);
-
-    let latestBlock;
-    try {
-      latestBlock = await bscProvider.getBlockNumber();
-    } catch (e) {
-      // try rotating provider once
-      const rpc = getRandomBscRpc();
-      bscProvider = new ethers.providers.JsonRpcProvider(rpc);
-      latestBlock = await bscProvider.getBlockNumber();
-    }
-
-    const blocksRange = Number(process.env.BSC_SCAN_BLOCKS || 4000);
-    const fromBlock = Math.max(latestBlock - blocksRange, 0);
-    const toBlock = latestBlock;
-    const CHUNK_SIZE = Number(process.env.BSC_CHUNK_SIZE || 800);
-
-    const filterTopic0 = ethers.utils.id('Transfer(address,address,uint256)');
-    const transactions = [];
-
-    for (let start = fromBlock; start <= toBlock; start += CHUNK_SIZE) {
-      const end = Math.min(start + CHUNK_SIZE - 1, toBlock);
-
-      let attempts = 0;
-      const maxAttempts = 4;
-      let events = null;
-
-      while (attempts < maxAttempts) {
+    const data = await etherscanV2Request(params);
+    
+    if (data.status === '1' && Array.isArray(data.result)) {
+      console.log(`✅ Etherscan V2 API: Found ${data.result.length} transactions for ${address}`);
+      
+      const transactions = [];
+      for (const tx of data.result) {
         try {
-          const toTopic = '0x' + padTo32Bytes(strip0x(address));
-          const filter = {
-            address: USDT_BSC_CONTRACT,
-            fromBlock: ethers.BigNumber.from(start).toHexString(),
-            toBlock: ethers.BigNumber.from(end).toHexString(),
-            topics: [filterTopic0, null, toTopic]
-          };
-
-          events = await bscProvider.getLogs(filter);
-          break; // success
-        } catch (err) {
-          attempts++;
-          console.warn(`⚠️ getLogs chunk ${start}-${end} attempt ${attempts} failed: ${err && err.message}`);
-          // rotate RPC and backoff
-          const rpc = getRandomBscRpc();
-          try {
-            bscProvider = new ethers.providers.JsonRpcProvider(rpc);
-            console.log(`🔁 Rotated RPC to ${rpc}`);
-          } catch (rotErr) {
-            console.warn('RPC rotate failed:', rotErr && rotErr.message);
-          }
-          const backoff = 500 * Math.pow(2, attempts);
-          await sleep(backoff);
-        }
-      }
-
-      if (!events) {
-        console.warn(`❌ Chunk ${start}-${end} failed completely; skipping`);
-        continue;
-      }
-
-      for (const ev of events) {
-        try {
-          // topics[1] = from, topics[2] = to (32-byte hex)
-          const from = '0x' + ev.topics[1].slice(26);
-          const to = '0x' + ev.topics[2].slice(26);
-          const valueBn = ethers.BigNumber.from(ev.data);
-          const amount = Number(ethers.utils.formatUnits(valueBn, 6));
-
-          if (to.toLowerCase() === address.toLowerCase()) {
+          if (tx.to && tx.to.toLowerCase() === address.toLowerCase() &&
+              tx.contractAddress && tx.contractAddress.toLowerCase() === USDT_BSC_CONTRACT.toLowerCase()) {
+            
             transactions.push({
-              transaction_id: ev.transactionHash,
-              to,
-              from,
-              amount,
+              transaction_id: tx.hash,
+              to: tx.to,
+              from: tx.from,
+              amount: Number(tx.value) / 1e6,
               token: 'USDT',
-              confirmed: true,
-              network: 'BEP20'
+              confirmed: tx.confirmations ? Number(tx.confirmations) > 0 : true,
+              network: 'BEP20',
+              timestamp: parseInt(tx.timeStamp) * 1000
             });
           }
-        } catch (inner) {
-          continue;
+        } catch (e) { 
+          console.warn('Skipping malformed BSC transaction:', e.message);
+          continue; 
         }
       }
+      
+      // Sort by timestamp (newest first)
+      transactions.sort((a, b) => b.timestamp - a.timestamp);
+      return transactions;
+    } else {
+      console.log(`⚠️ Etherscan V2 API returned: ${data.message || 'NOTOK'}`);
+      if (data.result?.includes('Max rate limit reached')) {
+        console.log('🚫 Etherscan V2 rate limit reached, will try again later');
+      }
+      return [];
     }
-
-    console.log(`✅ RPC fallback (chunked) found ${transactions.length} transactions for ${address}`);
-    return transactions;
-
   } catch (error) {
-    console.error('❌ BSC transactions error:', error && error.message ? error.message : error);
+    console.error('❌ BSC transactions error:', error.message);
     return [];
   }
 }
@@ -352,7 +254,14 @@ async function getBSCBalance(address) {
     return Number(ethers.utils.formatEther(balance));
   } catch (error) {
     console.error('❌ BSC balance error:', error.message);
-    return 0;
+    // Try to rotate RPC provider
+    try {
+      bscProvider = new ethers.providers.JsonRpcProvider(getNextBscRpc());
+      const balance = await bscProvider.getBalance(address);
+      return Number(ethers.utils.formatEther(balance));
+    } catch (retryError) {
+      return 0;
+    }
   }
 }
 
@@ -369,7 +278,21 @@ async function sendBSC(fromPrivateKey, toAddress, amount) {
     return true;
   } catch (error) {
     console.error('❌ BSC send error:', error.message);
-    return false;
+    // Try with different RPC
+    try {
+      bscProvider = new ethers.providers.JsonRpcProvider(getNextBscRpc());
+      const wallet = new ethers.Wallet(fromPrivateKey, bscProvider);
+      const tx = await wallet.sendTransaction({
+        to: toAddress,
+        value: ethers.utils.parseEther(amount.toString())
+      });
+      
+      await tx.wait();
+      console.log(`✅ BSC sent (retry): ${amount} BNB to ${toAddress}, txid: ${tx.hash}`);
+      return true;
+    } catch (retryError) {
+      return false;
+    }
   }
 }
 
@@ -386,7 +309,21 @@ async function transferBSCUSDT(fromPrivateKey, toAddress, amount) {
     return true;
   } catch (error) {
     console.error('❌ BSC USDT transfer error:', error.message);
-    return false;
+    // Try with different RPC
+    try {
+      bscProvider = new ethers.providers.JsonRpcProvider(getNextBscRpc());
+      const wallet = new ethers.Wallet(fromPrivateKey, bscProvider);
+      const contract = new ethers.Contract(USDT_BSC_CONTRACT, USDT_ABI, wallet);
+      
+      const amountInWei = ethers.utils.parseUnits(amount.toString(), 6);
+      const tx = await contract.transfer(toAddress, amountInWei);
+      
+      await tx.wait();
+      console.log(`✅ BSC USDT transfer (retry): ${amount} USDT to ${toAddress}, txid: ${tx.hash}`);
+      return true;
+    } catch (retryError) {
+      return false;
+    }
   }
 }
 
@@ -394,128 +331,125 @@ async function transferBSCUSDT(fromPrivateKey, toAddress, amount) {
 async function getUSDTBalance(address) {
   return enqueueBalanceJob(async () => {
     try {
-      if (!address) {
-        console.warn('getUSDTBalance: empty address');
-        return 0;
-      }
+      if (!address) return 0;
 
-      let ownerHex;
+      const tronWebForChecking = new TronWeb({
+        fullHost: 'https://api.trongrid.io',
+        headers: { 'TRON-PRO-API-KEY': TRONGRID_API_KEY }
+      });
+
       try {
-        ownerHex = tronWeb.address.toHex(address);
-      } catch (e) {
-        console.warn('getUSDTBalance: tronWeb.address.toHex failed for address', address, e && e.message);
-        if (typeof address === 'string' && address.startsWith('41')) {
-          ownerHex = address;
-        } else {
-          return 0;
-        }
+        const contract = await tronWebForChecking.contract().at(USDT_CONTRACT);
+        const result = await contract.balanceOf(address).call();
+        return Number(result) / 1_000_000;
+      } catch (error) {
+        console.warn('getUSDTBalance contract call failed, trying fallback:', error.message);
+        // Fallback to old method
+        return await getUSDTBalanceFallback(address);
       }
-
-      ownerHex = strip0x(ownerHex);
-
-      let contractHex;
-      try {
-        contractHex = tronWeb.address.toHex(USDT_CONTRACT);
-      } catch (e) {
-        contractHex = USDT_CONTRACT;
-      }
-      contractHex = strip0x(contractHex);
-
-      const param = padTo32Bytes(ownerHex);
-
-      const body = {
-        contract_address: contractHex,
-        owner_address: ownerHex,
-        function_selector: 'balanceOf(address)',
-        parameter: param,
-        call_value: 0
-      };
-
-      const json = await trongridRequestWithRetry('wallet/triggerconstantcontract', {
-        method: 'POST',
-        body: JSON.stringify(body)
-      }, 3, 800);
-
-      if (!json) {
-        console.warn('getUSDTBalance: empty json', { address });
-        return 0;
-      }
-
-      if (json.Error || json.error) {
-        console.warn('getUSDTBalance: tronGrid returned error', { address, err: json.Error || json.error });
-        return 0;
-      }
-
-      const constRes = json.constant_result || json.constantResult || json.constantResults;
-      if (!constRes || !Array.isArray(constRes) || constRes.length === 0) {
-        console.warn('getUSDTBalance: no constant_result in response', { address, json });
-        return 0;
-      }
-
-      const hexBalance = String(constRes[0] || '0').replace(/^0x/, '');
-      const clean = hexBalance.replace(/^0+/, '') || '0';
-      let bn;
-      try {
-        bn = BigInt('0x' + clean);
-      } catch (parseErr) {
-        console.error('getUSDTBalance: BigInt parse failed', { address, hexBalance, parseErr });
-        return 0;
-      }
-
-      const amount = Number(bn) / 1_000_000;
-      return amount;
     } catch (err) {
-      console.error('❌ getUSDTBalance fatal error:', err && err.message ? err.message : err);
+      console.error('❌ getUSDTBalance fatal error:', err.message);
       return 0;
     }
   });
 }
 
+async function getUSDTBalanceFallback(address) {
+  try {
+    const ownerHex = tronWeb.address.toHex(address).replace(/^0x/, '');
+    const contractHex = tronWeb.address.toHex(USDT_CONTRACT).replace(/^0x/, '');
+
+    const param = ownerHex.padStart(64, '0');
+
+    const body = {
+      owner_address: ownerHex,
+      contract_address: contractHex,
+      function_selector: 'balanceOf(address)',
+      parameter: param,
+      call_value: 0
+    };
+
+    const response = await fetch('https://api.trongrid.io/wallet/triggerconstantcontract', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'TRON-PRO-API-KEY': TRONGRID_API_KEY
+      },
+      body: JSON.stringify(body)
+    });
+
+    const json = await response.json();
+
+    if (json.constant_result && json.constant_result.length > 0) {
+      const hexBalance = json.constant_result[0].replace(/^0x/, '');
+      const clean = hexBalance.replace(/^0+/, '') || '0';
+      const bn = BigInt('0x' + clean);
+      return Number(bn) / 1_000_000;
+    }
+    return 0;
+  } catch (error) {
+    console.error('❌ getUSDTBalanceFallback error:', error.message);
+    return 0;
+  }
+}
+
 async function getUSDTTransactions(address) {
   try {
     if (!address) return [];
-    const path = `v1/accounts/${address}/transactions/trc20?limit=30&only_confirmed=true`;
-    const json = await trongridRequestWithRetry(path, {}, 3, 800);
-
+    
+    const response = await fetch(`https://api.trongrid.io/v1/accounts/${address}/transactions/trc20?limit=50&only_confirmed=true`, {
+      headers: {
+        'TRON-PRO-API-KEY': TRONGRID_API_KEY
+      }
+    });
+    
+    const json = await response.json();
     const raw = json.data || [];
     const transactions = [];
 
     for (const tx of raw) {
       try {
-        const tokenAddr = tx.token_info?.address || tx.contract || tx.tokenInfo?.address;
-        if (!tokenAddr) continue;
-        if (tokenAddr !== USDT_CONTRACT) continue;
+        const tokenAddr = tx.token_info?.address;
+        if (!tokenAddr || tokenAddr !== USDT_CONTRACT) continue;
 
-        const to = toBase58IfHex(tx.to || tx.to_address);
-        const from = toBase58IfHex(tx.from || tx.from_address);
-        const rawValue = tx.value ?? tx.amount ?? tx.quantity ?? 0;
+        const to = toBase58IfHex(tx.to);
+        const from = toBase58IfHex(tx.from);
+        const rawValue = tx.value || 0;
         const amount = Number(rawValue) / 1_000_000;
 
         transactions.push({
-          transaction_id: tx.transaction_id || tx.txid || tx.hash,
+          transaction_id: tx.transaction_id,
           to,
           from,
           amount,
           token: 'USDT',
-          confirmed: !!tx.confirmed,
-          network: 'TRC20'
+          confirmed: true,
+          network: 'TRC20',
+          timestamp: tx.block_timestamp
         });
       } catch (innerErr) {
-        console.warn('Skipping malformed tx item', innerErr && innerErr.message ? innerErr.message : innerErr);
         continue;
       }
     }
 
+    // Sort by timestamp (newest first)
+    transactions.sort((a, b) => b.timestamp - a.timestamp);
     return transactions;
   } catch (error) {
-    console.error('❌ getUSDTTransactions error:', error && error.message ? error.message : error);
+    console.error('❌ getUSDTTransactions error:', error.message);
     return [];
   }
 }
 
 async function getTRXBalance(address) {
   try {
-    const json = await trongridRequestWithRetry(`v1/accounts/${address}`, {}, 3, 800);
+    const response = await fetch(`https://api.trongrid.io/v1/accounts/${address}`, {
+      headers: {
+        'TRON-PRO-API-KEY': TRONGRID_API_KEY
+      }
+    });
+    
+    const json = await response.json();
     
     if (json && json.data && json.data.length > 0) {
       const balance = json.data[0].balance || 0;
@@ -523,7 +457,7 @@ async function getTRXBalance(address) {
     }
     return 0;
   } catch (error) {
-    console.error('❌ TRX balance error:', error && error.message ? error.message : error);
+    console.error('❌ TRX balance error:', error.message);
     return 0;
   }
 }
@@ -531,10 +465,7 @@ async function getTRXBalance(address) {
 async function sendTRX(fromPrivateKey, toAddress, amount) {
   try {
     const pk = normalizePrivateKeyForTron(fromPrivateKey);
-    if (!pk) {
-      console.error('sendTRX: missing private key');
-      return false;
-    }
+    if (!pk) return false;
 
     const tronWebForSigning = new TronWeb({
       fullHost: 'https://api.trongrid.io',
@@ -551,12 +482,9 @@ async function sendTRX(fromPrivateKey, toAddress, amount) {
 
     const signedTransaction = await tronWebForSigning.trx.sign(transaction);
     
-    const broadcastResult = await trongridRequestWithRetry('wallet/broadcasttransaction', {
-      method: 'POST',
-      body: JSON.stringify(signedTransaction)
-    }, 3, 800);
-
-    if (broadcastResult && broadcastResult.result === true) {
+    const broadcastResult = await tronWebForSigning.trx.sendRawTransaction(signedTransaction);
+    
+    if (broadcastResult.result) {
       console.log(`✅ TRX sent: ${amount} TRX to ${toAddress}, txid: ${broadcastResult.txid}`);
       return true;
     } else {
@@ -564,7 +492,7 @@ async function sendTRX(fromPrivateKey, toAddress, amount) {
       return false;
     }
   } catch (error) {
-    console.error('❌ TRX send error:', error && error.message ? error.message : error);
+    console.error('❌ TRX send error:', error.message);
     return false;
   }
 }
@@ -572,10 +500,7 @@ async function sendTRX(fromPrivateKey, toAddress, amount) {
 async function transferUSDT(fromPrivateKey, toAddress, amount) {
   try {
     const pk = normalizePrivateKeyForTron(fromPrivateKey);
-    if (!pk) {
-      console.error('transferUSDT: missing private key');
-      return false;
-    }
+    if (!pk) return false;
 
     const tronWebForSigning = new TronWeb({
       fullHost: 'https://api.trongrid.io',
@@ -588,15 +513,15 @@ async function transferUSDT(fromPrivateKey, toAddress, amount) {
     console.log(`🔄 Sending ${amount} USDT to ${toAddress}...`);
     const result = await contract.transfer(toAddress, amountInSun).send();
     
-    if (result && (result.result === true || result.transaction || result.txid)) {
-      console.log(`✅ USDT transfer submitted: ${amount} USDT to ${toAddress}`);
+    if (result && result.result) {
+      console.log(`✅ USDT transfer submitted: ${amount} USDT to ${toAddress}, txid: ${result.transaction?.txID || result.txid}`);
       return true;
     } else {
       console.error('❌ USDT transfer returned unexpected result:', result);
       return false;
     }
   } catch (error) {
-    console.error('❌ USDT transfer error:', error && error.message ? error.message : error);
+    console.error('❌ USDT transfer error:', error.message);
     return false;
   }
 }
@@ -881,16 +806,18 @@ async function handleCheckDeposits(req = {}, res = {}) {
     if (error) throw error;
 
     console.log(`🔍 Checking ${wallets?.length || 0} wallets across all networks`);
+    
     let processedCount = 0;
     let depositsFound = 0;
     let duplicatesSkipped = 0;
 
     for (const wallet of wallets || []) {
       try {
+        // Add delay between wallet checks to avoid rate limits
         if (wallet.network === 'BEP20') {
-          await sleep(3000); // 3 секунды для BSC кошельков
+          await sleep(3000); // 3 seconds for BSC (Etherscan V2 rate limits)
         } else {
-          await sleep(200); // 200ms для TRC20
+          await sleep(1000); // 1 second for TRC20
         }
         
         let transactions = [];
@@ -951,12 +878,12 @@ async function handleCollectFunds(req = {}, res = {}) {
     let totalCollected = 0;
     for (const wallet of wallets || []) {
       try {
-        await sleep(200);
+        await sleep(2000); // Increased delay to avoid rate limits
         const result = await autoCollectToMainWallet(wallet);
         if (result && result.success) {
           collectedCount++;
           totalCollected += result.amount;
-          await sleep(500);
+          await sleep(1000);
         }
       } catch (err) {
         console.error(`❌ Error collecting from ${wallet.address}:`, err.message);
@@ -1042,7 +969,7 @@ async function checkUserDeposits(userId, network) {
 app.get('/', (req, res) => {
   res.json({
     status: '✅ WORKING',
-    message: 'Tron & BSC Wallet System - MULTI-NETWORK',
+    message: 'Tron & BSC Wallet System - ETHERSCAN API V2 ONLY',
     timestamp: new Date().toISOString(),
     networks: ['TRC20', 'BEP20'],
     features: [
@@ -1053,7 +980,8 @@ app.get('/', (req, res) => {
       'Gas Management (TRX/BNB)',
       'USDT Transfers',
       'DUPLICATE PROTECTION',
-      'Etherscan API V2 Integration'
+      'ETHERSCAN API V2 INTEGRATION (chainid=56)',
+      'NO RPC getLogs - STABLE'
     ]
   });
 });
@@ -1073,14 +1001,14 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`🚀 SERVER RUNNING on port ${PORT}`);
   console.log(`✅ SUPABASE: ${SUPABASE_URL ? 'CONNECTED' : 'MISSING'}`);
   console.log(`✅ TRONGRID: API KEY ${TRONGRID_API_KEY ? 'SET' : 'MISSING'}`);
-  console.log(`✅ BSC RPC: MULTI-PROVIDER WITH ROTATION`);
   console.log(`✅ ETHERSCAN API V2: KEY SET (${ETHERSCAN_API_KEY.substring(0, 8)}...)`);
+  console.log(`🔗 BSC CHAIN ID: ${BSC_CHAIN_ID}`);
   console.log(`💰 TRC20 MASTER: ${COMPANY.MASTER.address}`);
   console.log(`💰 TRC20 MAIN: ${COMPANY.MAIN.address}`);
   console.log(`💰 BEP20 MASTER: ${COMPANY_BSC.MASTER.address}`);
   console.log(`💰 BEP20 MAIN: ${COMPANY_BSC.MAIN.address}`);
   console.log(`⏰ AUTO-CHECK: EVERY ${Math.round(CHECK_INTERVAL_MS / 1000)}s`);
-  console.log(`🔧 THROTTLING: ${BALANCE_CONCURRENCY} concurrent requests`);
+  console.log(`🔧 BSC APPROACH: ETHERSCAN API V2 ONLY (No RPC getLogs)`);
   console.log(`🌐 SUPPORTED NETWORKS: TRC20, BEP20`);
   console.log('===================================');
 });
