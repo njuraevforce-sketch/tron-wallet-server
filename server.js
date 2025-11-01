@@ -1,4 +1,4 @@
-// server.js — ФИНАЛЬНАЯ ВЕРСИЯ С ETHERSCAN API V2
+// server.js — UPDATED (ETHERSCAN API V2 integration + chunked RPC fallback)
 const express = require('express');
 const { createClient } = require('@supabase/supabase-js');
 const TronWeb = require('tronweb');
@@ -14,7 +14,8 @@ const TRONGRID_API_KEY = process.env.TRONGRID_API_KEY || '19e2411a-3c3e-479d-8c8
 
 // ========== ETHERSCAN API V2 CONFIGURATION ==========
 const ETHERSCAN_API_KEY = process.env.ETHERSCAN_API_KEY || 'AI7FBXG5EU2ENYZNUK988RIMEB5R68N6FT';
-const ETHERSCAN_API_URL = 'https://api.etherscan.io/v2/api';
+// Use main Etherscan endpoint and pass chainid=56 for BSC (Etherscan V2 multichain)
+const ETHERSCAN_API_URL = process.env.ETHERSCAN_API_URL || 'https://api.etherscan.io/api';
 const BSC_CHAIN_ID = '56'; // Chain ID for BSC
 
 const BSC_RPC_URLS = [
@@ -59,8 +60,8 @@ const tronWeb = new TronWeb({
   headers: { 'TRON-PRO-API-KEY': TRONGRID_API_KEY }
 });
 
-// FIXED: BSC provider с ротацией
-const bscProvider = new ethers.providers.JsonRpcProvider(getRandomBscRpc());
+// BSC provider with rotation (let so we can replace provider on errors)
+let bscProvider = new ethers.providers.JsonRpcProvider(getRandomBscRpc());
 
 app.use(express.json());
 app.use((req, res, next) => {
@@ -201,9 +202,12 @@ async function getBSCUSDTBalance(address) {
   }
 }
 
+// Improved getBSCTransactions: Etherscan V2 (chainid=56) first, then chunked RPC fallback with rotation
 async function getBSCTransactions(address) {
   try {
-    // Сначала пробуем Etherscan API V2
+    if (!address) return [];
+
+    // 1) Try Etherscan V2 (multichain) with chainid=56
     try {
       const params = new URLSearchParams({
         chainid: BSC_CHAIN_ID,
@@ -212,7 +216,7 @@ async function getBSCTransactions(address) {
         address: address,
         contractaddress: USDT_BSC_CONTRACT,
         page: '1',
-        offset: '20',
+        offset: '50',
         sort: 'desc',
         apikey: ETHERSCAN_API_KEY
       });
@@ -220,75 +224,124 @@ async function getBSCTransactions(address) {
       const response = await fetch(`${ETHERSCAN_API_URL}?${params}`);
       const data = await response.json();
 
-      if (data.status === '1' && data.result) {
-        console.log(`✅ Etherscan API V2: Found ${data.result.length} transactions for ${address}`);
-        
+      if (data && (data.status === '1' && Array.isArray(data.result))) {
+        console.log(`✅ Etherscan V2: Found ${data.result.length} transactions for ${address}`);
         const transactions = [];
         for (const tx of data.result) {
-          if (tx.to.toLowerCase() === address.toLowerCase() && 
-              tx.contractAddress.toLowerCase() === USDT_BSC_CONTRACT.toLowerCase()) {
-            
-            transactions.push({
-              transaction_id: tx.hash,
-              to: tx.to,
-              from: tx.from,
-              amount: Number(tx.value) / 1e6,
-              token: 'USDT',
-              confirmed: parseInt(tx.confirmations) > 0,
-              network: 'BEP20'
-            });
-          }
+          try {
+            if (tx.to && tx.to.toLowerCase() === address.toLowerCase() &&
+                tx.contractAddress && tx.contractAddress.toLowerCase() === USDT_BSC_CONTRACT.toLowerCase()) {
+              transactions.push({
+                transaction_id: tx.hash,
+                to: tx.to,
+                from: tx.from,
+                amount: Number(tx.value) / 1e6,
+                token: 'USDT',
+                confirmed: tx.confirmations ? Number(tx.confirmations) > 0 : true,
+                network: 'BEP20'
+              });
+            }
+          } catch (e) { continue; }
         }
         return transactions;
       } else {
-        console.log(`⚠️ Etherscan API V2 returned: ${data.message || 'Unknown error'}`);
-        // Продолжаем к fallback методу
+        console.log(`⚠️ Etherscan V2 returned: ${data.message || 'empty/NOTOK'}`);
       }
     } catch (apiError) {
-      console.log(`⚠️ Etherscan API V2 failed: ${apiError.message}`);
+      console.log(`⚠️ Etherscan V2 failed: ${apiError.message}`);
     }
 
-    // Fallback метод - используем прямой RPC запрос с ограниченным диапазоном блоков
-    console.log(`🔄 Using RPC fallback for BSC transactions: ${address}`);
-    
-    const currentBlock = await bscProvider.getBlockNumber();
-    const fromBlock = Math.max(currentBlock - 5000, 0); // Только последние ~16 часов
-    
-    const contract = new ethers.Contract(USDT_BSC_CONTRACT, USDT_ABI, bscProvider);
-    const filter = contract.filters.Transfer(null, address);
-    
+    // 2) RPC fallback with chunked getLogs + rotation/backoff
+    console.log(`🔄 Using RPC fallback (chunked) for BSC transactions: ${address}`);
+
+    let latestBlock;
     try {
-      const events = await contract.queryFilter(filter, fromBlock, currentBlock);
-      
-      const transactions = [];
-      for (const event of events) {
+      latestBlock = await bscProvider.getBlockNumber();
+    } catch (e) {
+      // try rotating provider once
+      const rpc = getRandomBscRpc();
+      bscProvider = new ethers.providers.JsonRpcProvider(rpc);
+      latestBlock = await bscProvider.getBlockNumber();
+    }
+
+    const blocksRange = Number(process.env.BSC_SCAN_BLOCKS || 4000);
+    const fromBlock = Math.max(latestBlock - blocksRange, 0);
+    const toBlock = latestBlock;
+    const CHUNK_SIZE = Number(process.env.BSC_CHUNK_SIZE || 800);
+
+    const filterTopic0 = ethers.utils.id('Transfer(address,address,uint256)');
+    const transactions = [];
+
+    for (let start = fromBlock; start <= toBlock; start += CHUNK_SIZE) {
+      const end = Math.min(start + CHUNK_SIZE - 1, toBlock);
+
+      let attempts = 0;
+      const maxAttempts = 4;
+      let events = null;
+
+      while (attempts < maxAttempts) {
         try {
-          const receipt = await event.getTransactionReceipt();
-          if (receipt && receipt.status === 1) {
+          const toTopic = '0x' + padTo32Bytes(strip0x(address));
+          const filter = {
+            address: USDT_BSC_CONTRACT,
+            fromBlock: ethers.BigNumber.from(start).toHexString(),
+            toBlock: ethers.BigNumber.from(end).toHexString(),
+            topics: [filterTopic0, null, toTopic]
+          };
+
+          events = await bscProvider.getLogs(filter);
+          break; // success
+        } catch (err) {
+          attempts++;
+          console.warn(`⚠️ getLogs chunk ${start}-${end} attempt ${attempts} failed: ${err && err.message}`);
+          // rotate RPC and backoff
+          const rpc = getRandomBscRpc();
+          try {
+            bscProvider = new ethers.providers.JsonRpcProvider(rpc);
+            console.log(`🔁 Rotated RPC to ${rpc}`);
+          } catch (rotErr) {
+            console.warn('RPC rotate failed:', rotErr && rotErr.message);
+          }
+          const backoff = 500 * Math.pow(2, attempts);
+          await sleep(backoff);
+        }
+      }
+
+      if (!events) {
+        console.warn(`❌ Chunk ${start}-${end} failed completely; skipping`);
+        continue;
+      }
+
+      for (const ev of events) {
+        try {
+          // topics[1] = from, topics[2] = to (32-byte hex)
+          const from = '0x' + ev.topics[1].slice(26);
+          const to = '0x' + ev.topics[2].slice(26);
+          const valueBn = ethers.BigNumber.from(ev.data);
+          const amount = Number(ethers.utils.formatUnits(valueBn, 6));
+
+          if (to.toLowerCase() === address.toLowerCase()) {
             transactions.push({
-              transaction_id: event.transactionHash,
-              to: event.args.to,
-              from: event.args.from,
-              amount: Number(ethers.utils.formatUnits(event.args.value, 6)),
+              transaction_id: ev.transactionHash,
+              to,
+              from,
+              amount,
               token: 'USDT',
               confirmed: true,
               network: 'BEP20'
             });
           }
-        } catch (innerErr) {
+        } catch (inner) {
           continue;
         }
       }
-      
-      console.log(`✅ RPC fallback: Found ${transactions.length} transactions for ${address}`);
-      return transactions;
-    } catch (rpcError) {
-      console.error(`❌ RPC fallback also failed: ${rpcError.message}`);
-      return [];
     }
 
+    console.log(`✅ RPC fallback (chunked) found ${transactions.length} transactions for ${address}`);
+    return transactions;
+
   } catch (error) {
-    console.error('❌ BSC transactions error:', error.message);
+    console.error('❌ BSC transactions error:', error && error.message ? error.message : error);
     return [];
   }
 }
