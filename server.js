@@ -13,6 +13,10 @@ const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || 'eyJh
 const TRONGRID_API_KEY = process.env.TRONGRID_API_KEY || '19e2411a-3c3e-479d-8c85-2abc716af397';
 const BSC_RPC_URL = process.env.BSC_RPC_URL || 'https://bsc-dataseed.binance.org/';
 
+// ========== BSCSCAN API CONFIG ==========
+const BSCSCAN_API_KEY = process.env.BSCSCAN_API_KEY || 'AI7FBXG5EU2ENYZNUK988RIMEB5R68N6FT';
+const BSCSCAN_API_URL = 'https://api.bscscan.com/api';
+
 // COMPANY wallets - TRC20
 const COMPANY = {
   MASTER: {
@@ -189,28 +193,40 @@ async function getBSCUSDTBalance(address) {
 
 async function getBSCTransactions(address) {
   try {
-    const currentBlock = await bscProvider.getBlockNumber();
-    const fromBlock = currentBlock - 10000;
-    
-    const contract = new ethers.Contract(USDT_BSC_CONTRACT, USDT_ABI, bscProvider);
-    const filter = contract.filters.Transfer(null, address);
-    const events = await contract.queryFilter(filter, fromBlock, currentBlock);
-    
+    const params = new URLSearchParams({
+      module: 'account',
+      action: 'tokentx',
+      address: address,
+      contractaddress: USDT_BSC_CONTRACT,
+      page: '1',
+      offset: '50',
+      sort: 'desc',
+      apikey: BSCSCAN_API_KEY
+    });
+
+    const response = await fetch(`${BSCSCAN_API_URL}?${params}`);
+    const data = await response.json();
+
+    if (data.status !== '1' || !data.result) {
+      console.log('📭 No BSC transactions found or API error:', data.message);
+      return [];
+    }
+
     const transactions = [];
     
-    for (const event of events) {
+    for (const tx of data.result) {
       try {
-        const receipt = await event.getTransactionReceipt();
-        
-        if (receipt.status === 1) {
+        // Проверяем, что это входящая транзакция на наш адрес
+        if (tx.to.toLowerCase() === address.toLowerCase() && 
+            tx.contractAddress.toLowerCase() === USDT_BSC_CONTRACT.toLowerCase()) {
+          
           transactions.push({
-            transaction_id: event.transactionHash,
-            to: event.args.to,
-            from: event.args.from,
-            // FIXED: formatUnits для Node.js 18
-            amount: Number(ethers.utils.formatUnits(event.args.value, 6)),
+            transaction_id: tx.hash,
+            to: tx.to,
+            from: tx.from,
+            amount: Number(tx.value) / 1e6, // USDT имеет 6 decimals
             token: 'USDT',
-            confirmed: true,
+            confirmed: parseInt(tx.confirmations) > 0,
             network: 'BEP20'
           });
         }
@@ -219,10 +235,11 @@ async function getBSCTransactions(address) {
         continue;
       }
     }
-    
+
+    console.log(`✅ Found ${transactions.length} BSC transactions for ${address}`);
     return transactions;
   } catch (error) {
-    console.error('❌ BSC transactions error:', error.message);
+    console.error('❌ BSC transactions error (BscScan API):', error.message);
     return [];
   }
 }
@@ -931,7 +948,8 @@ app.get('/', (req, res) => {
       'Auto Collection (throttled)',
       'Gas Management (TRX/BNB)',
       'USDT Transfers',
-      'DUPLICATE PROTECTION'
+      'DUPLICATE PROTECTION',
+      'BscScan API Integration'
     ]
   });
 });
@@ -952,6 +970,7 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`✅ SUPABASE: ${SUPABASE_URL ? 'CONNECTED' : 'MISSING'}`);
   console.log(`✅ TRONGRID: API KEY ${TRONGRID_API_KEY ? 'SET' : 'MISSING'}`);
   console.log(`✅ BSC RPC: ${BSC_RPC_URL ? 'CONNECTED' : 'MISSING'}`);
+  console.log(`✅ BSCSCAN API: KEY SET (${BSCSCAN_API_KEY.substring(0, 8)}...)`);
   console.log(`💰 TRC20 MASTER: ${COMPANY.MASTER.address}`);
   console.log(`💰 TRC20 MAIN: ${COMPANY.MAIN.address}`);
   console.log(`💰 BEP20 MASTER: ${COMPANY_BSC.MASTER.address}`);
