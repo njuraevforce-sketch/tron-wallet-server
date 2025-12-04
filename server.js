@@ -1,18 +1,18 @@
-// server.js — АДАПТИРОВАН ДЛЯ GLY PLATFORM
+// server.js — OPTIMIZED FOR TRC20 & BEP20
 const express = require('express');
 const { createClient } = require('@supabase/supabase-js');
 const TronWeb = require('tronweb');
 
 const app = express();
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 8080;
 
-// ========== КОНФИГУРАЦИЯ GLY ==========
+// ========== CONFIGURATION ==========
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://jxyazsguwkbklavamzyj.supabase.co';
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imp4eWF6c2d1d2tia2xhdmFtenlqIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc2NDU1MjgzMywiZXhwIjoyMDgwMTI4ODMzfQ.nvjoMzRgLRmR3ekIYgIzLTO_Hdxh37is1m3BApY9xk4';
 const TRONGRID_API_KEY = process.env.TRONGRID_API_KEY || '8fa63ef4-f010-4ad2-a556-a7124563bafd';
-const MORALIS_API_KEY = process.env.MORALIS_API_KEY || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJub25jZSI6ImQ0NWE5ODZjLWI3ZWItNGJhNC04NDdlLTE1YWFlNTYyNDNhOSIsIm9yZ0lkIjoiNDgxMTM3IiwidXNlcklkIjoiNDk0OTkyIiwidHlwZUlkIjoiYTYzNmUzYjQtN2QyYS00OTlhLTlhM2MtZjZhODA0M2Y1NGZmIiwidHlwZSI6IlBST0pFQ1QiLCJpYXQiOjE3NjMwMzE2NzgsImV4cCI6NDkxODc5MTY3OH0.ZaidcBOM5qWrYRPdFwrDXABVWLh-LmYbfNAmyG-a_jE';
+const MORALIS_API_KEY = process.env.MORALIS_API_KEY || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJub25jZSI6ImQ0NWE5ODZjLWI3ZWItNGJhNC04NDdlLTE1YWFlNTYyNDNhOSIsIm9yZ2lkIjoiNDgxMTM3IiwidXNlcklkIjoiNDk0OTkyIiwidHlwZUlkIjoiYTYzNmUzYjQtN2QyYS00OTlhLTlhM2MtZjZhODA0M2Y1NGZmIiwidHlwZSI6IlBST0pFQ1QiLCJpYXQiOjE3NjMwMzE2NzgsImV4cCI6NDkxODc5MTY3OH0.ZaidcBOM5qWrYRPdFwrDXABVWLh-LmYbfNAmyG-a_jE';
 
-// ========== МИДЛВАРЕ ==========
+// ========== MIDDLEWARE ==========
 app.use(express.json());
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
@@ -21,11 +21,11 @@ app.use((req, res, next) => {
   next();
 });
 
-// ========== HTTP РОУТЫ ==========
+// ========== HTTP ROUTES ==========
 app.get('/', (req, res) => {
   res.json({
-    status: '✅ СЕРВЕР РАБОТАЕТ',
-    message: 'GLY Auto Deposit Processing System',
+    status: '✅ SERVER IS RUNNING',
+    message: 'GLY Deposit Processing System',
     timestamp: new Date().toISOString(),
     uptime: process.uptime(),
     environment: process.env.NODE_ENV || 'development'
@@ -34,7 +34,7 @@ app.get('/', (req, res) => {
 
 app.get('/health', (req, res) => {
   res.json({
-    status: '✅ ЗДОРОВ',
+    status: '✅ HEALTHY',
     service: 'GLY Deposit Processor',
     timestamp: new Date().toISOString(),
     uptime: process.uptime()
@@ -43,30 +43,30 @@ app.get('/health', (req, res) => {
 
 app.get('/api/health', (req, res) => {
   res.json({
-    status: '✅ API ЗДОРОВ',
+    status: '✅ API HEALTHY',
     timestamp: new Date().toISOString()
   });
 });
 
-// ========== ИНИЦИАЛИЗАЦИЯ СЕРВИСОВ ==========
+// ========== INITIALIZE SERVICES ==========
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 const tronWeb = new TronWeb({
   fullHost: 'https://api.trongrid.io',
   headers: { 'TRON-PRO-API-KEY': TRONGRID_API_KEY }
 });
 
-// ========== КОНСТАНТЫ ==========
+// ========== CONSTANTS ==========
 const USDT_CONTRACT = 'TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t';
 const USDT_BSC_CONTRACT = '0x55d398326f99059fF775485246999027B3197955';
 const MIN_DEPOSIT = 17;
 
-// ========== ОПТИМИЗИРОВАННЫЕ НАСТРОЙКИ ==========
-const TRC20_CHECK_INTERVAL = 45000; // 45 секунд - TRC20 быстрый
-const BEP20_CHECK_INTERVAL = 180000; // 3 минуты - BEP20 экономный
+// ========== OPTIMIZED SETTINGS ==========
+const TRC20_CHECK_INTERVAL = 45000; // 45 секунд
+const BEP20_CHECK_INTERVAL = 180000; // 3 минуты
 const BEP20_DELAY_MS = 500; // 2 запроса/секунду для Moralis
 const TRC20_DELAY_MS = 100; // 10 запросов/секунду для TronGrid
 
-// ========== ПОМОЩНИКИ ==========
+// ========== HELPERS ==========
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
@@ -84,7 +84,7 @@ function toBase58IfHex(addr) {
   return addr;
 }
 
-// ========== ГЕНЕРАЦИЯ КОШЕЛЬКА ==========
+// ========== WALLET GENERATION ==========
 async function generateTRC20Wallet() {
   try {
     const account = await tronWeb.createAccount();
@@ -93,7 +93,7 @@ async function generateTRC20Wallet() {
       privateKey: account.privateKey
     };
   } catch (error) {
-    console.error('❌ Ошибка генерации TRC20 кошелька:', error);
+    console.error('❌ TRC20 wallet generation error:', error);
     throw error;
   }
 }
@@ -107,17 +107,17 @@ async function generateBEP20Wallet() {
       privateKey: wallet.privateKey
     };
   } catch (error) {
-    console.error('❌ Ошибка генерации BEP20 кошелька:', error);
+    console.error('❌ BEP20 wallet generation error:', error);
     throw error;
   }
 }
 
-// ========== ОБРАБОТКА ДЕПОЗИТА ==========
+// ========== DEPOSIT PROCESSING ==========
 async function processDeposit(wallet, amount, txid, network) {
   try {
-    console.log(`💰 ОБРАБОТКА ДЕПОЗИТА: ${amount} USDT для пользователя ${wallet.user_id}, txid: ${txid}, сеть: ${network}`);
+    console.log(`💰 PROCESSING DEPOSIT: ${amount} USDT for user ${wallet.user_id}, txid: ${txid}, network: ${network}`);
 
-    // Проверка дублирующей транзакции
+    // Check for duplicate transaction
     const { data: existingDeposit, error: checkError } = await supabase
       .from('deposit_transactions')
       .select('id, status, amount')
@@ -126,19 +126,16 @@ async function processDeposit(wallet, amount, txid, network) {
       .maybeSingle();
 
     if (checkError) {
-      console.error('Ошибка проверки существующего депозита:', checkError);
+      console.error('Error checking existing deposit:', checkError);
       throw checkError;
     }
 
     if (existingDeposit) {
-      console.log(`✅ Депозит уже обработан: ${txid}, статус: ${existingDeposit.status}, сумма: ${existingDeposit.amount}`);
+      console.log(`✅ Deposit already processed: ${txid}, status: ${existingDeposit.status}, amount: ${existingDeposit.amount}`);
       return { success: false, reason: 'already_processed', existing: existingDeposit };
     }
 
-    // Проверка существования пользователя
-    await ensureUserExists(wallet.user_id);
-
-    // Вставка записи о депозите
+    // Insert deposit transaction
     const { data: newDeposit, error: depositError } = await supabase
       .from('deposit_transactions')
       .insert({
@@ -154,22 +151,22 @@ async function processDeposit(wallet, amount, txid, network) {
 
     if (depositError) {
       if (depositError.code === '23505') {
-        console.log(`🔄 Депозит уже обрабатывается другим потоком: ${txid}`);
+        console.log(`🔄 Deposit already being processed by another thread: ${txid}`);
         return { success: false, reason: 'concurrent_processing' };
       }
-      throw new Error(`Ошибка вставки депозита: ${depositError.message}`);
+      throw new Error(`Deposit insert failed: ${depositError.message}`);
     }
 
-    // Обновление баланса пользователя
+    // Update user balance
     const { data: user, error: userError } = await supabase
       .from('users')
-      .select('balance, vip_level')
+      .select('balance, total_profit, vip_level')
       .eq('id', wallet.user_id)
       .single();
 
     if (userError) {
       await supabase.from('deposit_transactions').delete().eq('id', newDeposit.id);
-      throw new Error(`Ошибка получения пользователя: ${userError.message}`);
+      throw new Error(`user fetch error: ${userError.message}`);
     }
 
     const currentBalance = Number(user.balance) || 0;
@@ -185,61 +182,58 @@ async function processDeposit(wallet, amount, txid, network) {
 
     if (updateError) {
       await supabase.from('deposit_transactions').delete().eq('id', newDeposit.id);
-      throw new Error(`Ошибка обновления баланса: ${updateError.message}`);
+      throw new Error(`Balance update failed: ${updateError.message}`);
     }
 
-    // Создание записи транзакции
+    // Create transaction record
     await supabase.from('transactions').insert({
       user_id: wallet.user_id,
       type: 'deposit',
       amount: amount,
       status: 'completed',
-      description: `Auto deposit ${amount} USDT (${network})`,
+      description: `Deposit ${amount} USDT (${network})`,
       created_at: new Date().toISOString()
     });
 
-    // Обновление VIP уровня если применимо
-    if (newBalance >= 20 && user.vip_level === 1) {
-      await supabase
-        .from('users')
-        .update({ vip_level: 1 })
-        .eq('id', wallet.user_id);
-      console.log(`⭐ VIP уровень повышен до 1 для пользователя ${wallet.user_id}`);
-    }
+    // Update deposit status to processed
+    await supabase
+      .from('deposit_transactions')
+      .update({ status: 'processed' })
+      .eq('id', newDeposit.id);
 
-    console.log(`✅ ДЕПОЗИТ ОБРАБОТАН: ${amount} USDT для пользователя ${wallet.user_id}`);
-    console.log(`💰 Новый баланс: ${newBalance} USDT`);
+    console.log(`✅ DEPOSIT PROCESSED: ${amount} USDT for user ${wallet.user_id}`);
+    console.log(`💰 New balance: ${newBalance} USDT`);
 
     return { success: true, amount, deposit_id: newDeposit.id };
 
   } catch (error) {
-    console.error('❌ Ошибка обработки депозита:', error.message);
+    console.error('❌ Error processing deposit:', error.message);
     throw error;
   }
 }
 
-// ========== API ЭНДПОИНТЫ ==========
+// ========== API Endpoints ==========
 app.post('/api/deposit/generate', async (req, res) => {
   try {
     const { user_id, network = 'trc20' } = req.query;
-    if (!user_id) return res.status(400).json({ success: false, error: 'User ID обязателен' });
+    if (!user_id) return res.status(400).json({ success: false, error: 'User ID is required' });
 
-    console.log(`🔐 Генерация ${network} кошелька для пользователя: ${user_id}`);
-    await ensureUserExists(user_id);
+    console.log(`🔐 Generating ${network} wallet for user: ${user_id}`);
 
-    // Проверка существующего кошелька
+    // Check if wallet already exists
     const { data: existingWallet } = await supabase
       .from('deposit_addresses')
-      .select('address')
+      .select('address, private_key')
       .eq('user_id', user_id)
       .eq('network', network)
       .single();
 
     if (existingWallet) {
-      console.log(`✅ Кошелек уже существует: ${existingWallet.address} (${network})`);
+      console.log(`✅ Wallet already exists: ${existingWallet.address} (${network})`);
       return res.json({ 
         success: true, 
         address: existingWallet.address, 
+        private_key: existingWallet.private_key,
         exists: true, 
         network 
       });
@@ -247,7 +241,7 @@ app.post('/api/deposit/generate', async (req, res) => {
 
     let address, private_key;
 
-    // Генерация нового кошелька
+    // Generate new wallet
     if (network === 'trc20') {
       const wallet = await generateTRC20Wallet();
       address = wallet.address;
@@ -257,10 +251,10 @@ app.post('/api/deposit/generate', async (req, res) => {
       address = wallet.address;
       private_key = wallet.privateKey;
     } else {
-      return res.status(400).json({ success: false, error: 'Неподдерживаемая сеть' });
+      return res.status(400).json({ success: false, error: 'Unsupported network' });
     }
 
-    // Сохранение в базу данных
+    // Save to database
     const { data, error } = await supabase.from('deposit_addresses').insert({
       user_id,
       address,
@@ -270,13 +264,13 @@ app.post('/api/deposit/generate', async (req, res) => {
     }).select().single();
 
     if (error) {
-      console.error('❌ Ошибка базы данных:', error);
-      return res.status(500).json({ success: false, error: 'Ошибка сохранения кошелька' });
+      console.error('❌ Database error:', error);
+      return res.status(500).json({ success: false, error: 'Failed to save wallet' });
     }
 
-    console.log(`✅ Новый ${network} кошелек создан: ${address}`);
+    console.log(`✅ New ${network} wallet created: ${address}`);
     
-    // Немедленная проверка существующих депозитов
+    // Check for existing deposits immediately
     setTimeout(() => {
       if (network === 'trc20') {
         checkUserTRC20Deposits(user_id);
@@ -288,19 +282,20 @@ app.post('/api/deposit/generate', async (req, res) => {
     res.json({ 
       success: true, 
       address, 
+      private_key,
       exists: false, 
       network 
     });
   } catch (error) {
-    console.error('❌ Ошибка генерации кошелька:', error.message);
-    res.status(500).json({ success: false, error: 'Внутренняя ошибка сервера' });
+    console.error('❌ Generate wallet error:', error.message);
+    res.status(500).json({ success: false, error: 'Internal server error' });
   }
 });
 
 app.get('/api/deposit/history', async (req, res) => {
   try {
     const { user_id, network = 'trc20' } = req.query;
-    if (!user_id) return res.status(400).json({ success: false, error: 'User ID обязателен' });
+    if (!user_id) return res.status(400).json({ success: false, error: 'User ID is required' });
 
     const { data: deposits, error } = await supabase
       .from('deposit_transactions')
@@ -311,21 +306,21 @@ app.get('/api/deposit/history', async (req, res) => {
       .limit(20);
 
     if (error) {
-      console.error('❌ Ошибка базы данных:', error);
-      return res.status(500).json({ success: false, error: 'Ошибка получения истории депозитов' });
+      console.error('❌ Database error:', error);
+      return res.status(500).json({ success: false, error: 'Failed to fetch deposit history' });
     }
 
     res.json({ success: true, deposits: deposits || [] });
   } catch (error) {
-    console.error('❌ Ошибка истории депозитов:', error.message);
-    res.status(500).json({ success: false, error: 'Внутренняя ошибка сервера' });
+    console.error('❌ Deposit history error:', error.message);
+    res.status(500).json({ success: false, error: 'Internal server error' });
   }
 });
 
-// ========== ПРОВЕРКА ДЕПОЗИТОВ ==========
+// ========== DEPOSIT CHECKING ==========
 app.get('/api/check-deposits', async (req, res) => { 
   try {
-    console.log('🔄 Ручная проверка депозитов через API');
+    console.log('🔄 Manual deposit check triggered via API');
     const trc20Result = await handleCheckTRC20Deposits();
     const bep20Result = await handleCheckBEP20Deposits();
     
@@ -339,7 +334,7 @@ app.get('/api/check-deposits', async (req, res) => {
   }
 });
 
-// ========== TRC20 ТРАНЗАКЦИИ (БЫСТРО - БЕЗ ЛИМИТОВ) ==========
+// ========== TRC20 TRANSACTIONS ==========
 async function getTRC20Transactions(address) {
   try {
     if (!address) return [];
@@ -384,15 +379,15 @@ async function getTRC20Transactions(address) {
     transactions.sort((a, b) => b.timestamp - a.timestamp);
     return transactions;
   } catch (error) {
-    console.error('❌ Ошибка TRC20 транзакций:', error.message);
+    console.error('❌ TRC20 transactions error:', error.message);
     return [];
   }
 }
 
-// ========== BEP20 ТРАНЗАКЦИИ (ОПТИМИЗИРОВАННО ДЛЯ 40K DCU) ==========
+// ========== BEP20 TRANSACTIONS ==========
 async function getBEP20Transactions(address) {
   try {
-    console.log(`🔍 Проверка BEP20 через Moralis: ${address}`);
+    console.log(`🔍 Checking BEP20 via Moralis: ${address}`);
     
     const response = await fetch(
       `https://deep-index.moralis.io/api/v2/${address}/erc20/transfers?chain=bsc&token_addresses=${USDT_BSC_CONTRACT}&limit=5`,
@@ -405,7 +400,7 @@ async function getBEP20Transactions(address) {
     );
 
     if (!response.ok) {
-      throw new Error(`Ошибка API Moralis: ${response.status}`);
+      throw new Error(`Moralis API error: ${response.status}`);
     }
 
     const data = await response.json();
@@ -435,19 +430,19 @@ async function getBEP20Transactions(address) {
       }
     }
 
-    console.log(`✅ Найдено ${transactions.length} BEP20 транзакций для ${address}`);
+    console.log(`✅ Found ${transactions.length} BEP20 transactions for ${address}`);
     return transactions;
 
   } catch (error) {
-    console.error('❌ Ошибка API Moralis:', error.message);
+    console.error('❌ Moralis API error:', error.message);
     return [];
   }
 }
 
-// ========== ОПТИМИЗИРОВАННАЯ ПРОВЕРКА TRC20 ==========
+// ========== OPTIMIZED TRC20 CHECKING ==========
 async function handleCheckTRC20Deposits() {
   try {
-    console.log('🔄 Проверка TRC20 депозитов...');
+    console.log('🔄 Checking TRC20 deposits...');
     
     const { data: wallets, error } = await supabase
       .from('deposit_addresses')
@@ -472,32 +467,32 @@ async function handleCheckTRC20Deposits() {
               const result = await processDeposit(wallet, tx.amount, tx.transaction_id, 'trc20');
               if (result.success) {
                 depositsFound++;
-                console.log(`💰 НОВЫЙ TRC20 ДЕПОЗИТ: ${tx.amount} USDT для пользователя ${wallet.user_id}`);
+                console.log(`💰 NEW TRC20 DEPOSIT: ${tx.amount} USDT for user ${wallet.user_id}`);
               }
             } catch (err) {
-              console.error(`❌ Ошибка обработки TRC20 депозита ${tx.transaction_id}:`, err.message);
+              console.error(`❌ Error processing TRC20 deposit ${tx.transaction_id}:`, err.message);
             }
           }
         }
         processedCount++;
       } catch (err) {
-        console.error(`❌ Ошибка обработки TRC20 кошелька ${wallet.address}:`, err.message);
+        console.error(`❌ Error processing TRC20 wallet ${wallet.address}:`, err.message);
       }
     }
 
-    console.log(`✅ TRC20: Обработано ${processedCount} кошельков, найдено ${depositsFound} депозитов`);
+    console.log(`✅ TRC20: Processed ${processedCount} wallets, found ${depositsFound} deposits`);
     return { success: true, processed: processedCount, deposits: depositsFound };
     
   } catch (error) {
-    console.error('❌ Ошибка проверки TRC20:', error.message);
+    console.error('❌ TRC20 check error:', error.message);
     return { success: false, error: error.message };
   }
 }
 
-// ========== ОПТИМИЗИРОВАННАЯ ПРОВЕРКА BEP20 ==========
+// ========== OPTIMIZED BEP20 CHECKING ==========
 async function handleCheckBEP20Deposits() {
   try {
-    console.log('🔄 Проверка BEP20 депозитов...');
+    console.log('🔄 Checking BEP20 deposits...');
     
     const { data: wallets, error } = await supabase
       .from('deposit_addresses')
@@ -522,51 +517,29 @@ async function handleCheckBEP20Deposits() {
               const result = await processDeposit(wallet, tx.amount, tx.transaction_id, 'bep20');
               if (result.success) {
                 depositsFound++;
-                console.log(`💰 НОВЫЙ BEP20 ДЕПОЗИТ: ${tx.amount} USDT для пользователя ${wallet.user_id}`);
+                console.log(`💰 NEW BEP20 DEPOSIT: ${tx.amount} USDT for user ${wallet.user_id}`);
               }
             } catch (err) {
-              console.error(`❌ Ошибка обработки BEP20 депозита ${tx.transaction_id}:`, err.message);
+              console.error(`❌ Error processing BEP20 deposit ${tx.transaction_id}:`, err.message);
             }
           }
         }
         processedCount++;
       } catch (err) {
-        console.error(`❌ Ошибка обработки BEP20 кошелька ${wallet.address}:`, err.message);
+        console.error(`❌ Error processing BEP20 wallet ${wallet.address}:`, err.message);
       }
     }
 
-    console.log(`✅ BEP20: Обработано ${processedCount} кошельков, найдено ${depositsFound} депозитов`);
+    console.log(`✅ BEP20: Processed ${processedCount} wallets, found ${depositsFound} deposits`);
     return { success: true, processed: processedCount, deposits: depositsFound };
     
   } catch (error) {
-    console.error('❌ Ошибка проверки BEP20:', error.message);
+    console.error('❌ BEP20 check error:', error.message);
     return { success: false, error: error.message };
   }
 }
 
-// ========== ПОМОЩНИКИ ==========
-async function ensureUserExists(userId) {
-  try {
-    const { data } = await supabase.from('users').select('id').eq('id', userId).single();
-    if (!data) {
-      await supabase.from('users').insert({
-        id: userId,
-        username: `user-${userId}`,
-        email: `user-${userId}@gly.io`,
-        password: 'temp123',
-        payment_password: 'temp123',
-        invite_code: `REF-${userId.substring(0, 8)}`,
-        balance: 0.00,
-        vip_level: 1,
-        created_at: new Date().toISOString()
-      });
-      console.log(`✅ Пользователь создан: ${userId}`);
-    }
-  } catch (error) {
-    console.error('❌ Ошибка ensureUserExists:', error.message);
-  }
-}
-
+// ========== HELPER FUNCTIONS ==========
 async function checkUserTRC20Deposits(userId) {
   try {
     const { data: wallet } = await supabase
@@ -585,15 +558,15 @@ async function checkUserTRC20Deposits(userId) {
         try {
           const result = await processDeposit(wallet, tx.amount, tx.transaction_id, 'trc20');
           if (result.success) {
-            console.log(`💰 НАЙДЕН НОВЫЙ TRC20 ДЕПОЗИТ: ${tx.amount} USDT для пользователя ${userId}`);
+            console.log(`💰 FOUND NEW TRC20 DEPOSIT: ${tx.amount} USDT for user ${userId}`);
           }
         } catch (err) {
-          console.error(`❌ Ошибка обработки транзакции ${tx.transaction_id}:`, err);
+          console.error(`❌ Error processing transaction ${tx.transaction_id}:`, err);
         }
       }
     }
   } catch (error) {
-    console.error('❌ Ошибка checkUserTRC20Deposits:', error);
+    console.error('❌ checkUserTRC20Deposits error:', error);
   }
 }
 
@@ -615,36 +588,36 @@ async function checkUserBEP20Deposits(userId) {
         try {
           const result = await processDeposit(wallet, tx.amount, tx.transaction_id, 'bep20');
           if (result.success) {
-            console.log(`💰 НАЙДЕН НОВЫЙ BEP20 ДЕПОЗИТ: ${tx.amount} USDT для пользователя ${userId}`);
+            console.log(`💰 FOUND NEW BEP20 DEPOSIT: ${tx.amount} USDT for user ${userId}`);
           }
         } catch (err) {
-          console.error(`❌ Ошибка обработки транзакции ${tx.transaction_id}:`, err);
+          console.error(`❌ Error processing transaction ${tx.transaction_id}:`, err);
         }
       }
     }
   } catch (error) {
-    console.error('❌ Ошибка checkUserBEP20Deposits:', error);
+    console.error('❌ checkUserBEP20Deposits error:', error);
   }
 }
 
-// ========== ЗАПУСК СЕРВЕРА ==========
+// ========== START SERVER ==========
 const server = app.listen(PORT, '0.0.0.0', () => {
-  console.log(`🚀 HTTP СЕРВЕР ЗАПУЩЕН на порту ${PORT}`);
-  console.log(`✅ Проверка здоровья: http://0.0.0.0:${PORT}/health`);
-  console.log(`✅ Проверка API здоровья: http://0.0.0.0:${PORT}/api/health`);
-  console.log(`✅ SUPABASE: ПОДКЛЮЧЕН`);
-  console.log(`✅ TRONGRID: API KEY УСТАНОВЛЕН (100K запросов/день)`);
-  console.log(`✅ MORALIS: API KEY УСТАНОВЛЕН (40K DCU/день)`);
-  console.log(`✅ TRC20: Проверка каждые 45 секунд`);
-  console.log(`✅ BEP20: Проверка каждые 3 минуты`);
+  console.log(`🚀 HTTP SERVER RUNNING on port ${PORT}`);
+  console.log(`✅ Health check available at: http://0.0.0.0:${PORT}/health`);
+  console.log(`✅ API Health check: http://0.0.0.0:${PORT}/api/health`);
+  console.log(`✅ SUPABASE: CONNECTED`);
+  console.log(`✅ TRONGRID: API KEY SET`);
+  console.log(`✅ MORALIS: API KEY SET`);
+  console.log(`✅ TRC20: Checking every 45 seconds`);
+  console.log(`✅ BEP20: Checking every 3 minutes`);
   console.log('===================================');
 });
 
-// ========== ФОНОВЫЕ ЗАДАЧИ ==========
+// ========== BACKGROUND TASKS ==========
 let isCheckingTRC20 = false;
 let isCheckingBEP20 = false;
 
-// TRC20 фоновая проверка (Быстрая)
+// TRC20 Background Check (Fast)
 setInterval(async () => {
   if (isCheckingTRC20) return;
   
@@ -652,13 +625,13 @@ setInterval(async () => {
     isCheckingTRC20 = true;
     await handleCheckTRC20Deposits();
   } catch (err) {
-    console.error('❌ Ошибка автоматической проверки TRC20:', err.message);
+    console.error('❌ TRC20 auto-check error:', err.message);
   } finally {
     isCheckingTRC20 = false;
   }
 }, TRC20_CHECK_INTERVAL);
 
-// BEP20 фоновая проверка (Оптимизированная для DCU)
+// BEP20 Background Check (Optimized for DCU)
 setInterval(async () => {
   if (isCheckingBEP20) return;
   
@@ -666,7 +639,7 @@ setInterval(async () => {
     isCheckingBEP20 = true;
     await handleCheckBEP20Deposits();
   } catch (err) {
-    console.error('❌ Ошибка автоматической проверки BEP20:', err.message);
+    console.error('❌ BEP20 auto-check error:', err.message);
   } finally {
     isCheckingBEP20 = false;
   }
@@ -674,19 +647,19 @@ setInterval(async () => {
 
 // Graceful shutdown
 process.on('SIGTERM', () => {
-  console.log('🛑 Получен SIGTERM, завершение работы');
+  console.log('🛑 Received SIGTERM, shutting down gracefully');
   server.close(() => {
-    console.log('✅ Сервер закрыт');
+    console.log('✅ Server closed');
     process.exit(0);
   });
 });
 
 // Handle uncaught exceptions
 process.on('uncaughtException', (error) => {
-  console.error('❌ Необработанное исключение:', error);
+  console.error('❌ Uncaught Exception:', error);
   process.exit(1);
 });
 
 process.on('unhandledRejection', (reason, promise) => {
-  console.error('❌ Необработанное отклонение промиса:', promise, 'причина:', reason);
+  console.error('❌ Unhandled Rejection at:', promise, 'reason:', reason);
 });
