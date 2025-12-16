@@ -1,4 +1,4 @@
-// server.js — OPTIMIZED FOR TRC20 & BEP20 WITH ATOMIC DEPOSITS
+// server.js — OPTIMIZED FOR TRC20 & BEP20 WITH DUPLICATE PROTECTION
 const express = require('express');
 const { createClient } = require('@supabase/supabase-js');
 const TronWeb = require('tronweb');
@@ -7,10 +7,10 @@ const app = express();
 const PORT = process.env.PORT || 8080;
 
 // ========== CONFIGURATION ==========
-const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
-const TRONGRID_API_KEY = process.env.TRONGRID_API_KEY;
-const MORALIS_API_KEY = process.env.MORALIS_API_KEY;
+const SUPABASE_URL = process.env.SUPABASE_URL || 'https://jxyazsguwkbklavamzyj.supabase.co';
+const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imp4eWF6c2d1d2tia2xhdmFtenlqIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc2NDU1MjgzMywiZXhwIjoyMDgwMTI4ODMzfQ.nvjoMzRgLRmR3ekIYgIzLTO_Hdxh37is1m3BApY9xk4';
+const TRONGRID_API_KEY = process.env.TRONGRID_API_KEY || '8fa63ef4-f010-4ad2-a556-a7124563bafd';
+const MORALIS_API_KEY = process.env.MORALIS_API_KEY || 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJub25jZSI6ImQ4YzU0YWNmLTYyMTUtNDg4Yi05Y2UxLTc0N2M0YWU0YzhiMSIsIm9yZ0lkIjoiNDg1NjQ0IiwidXNlcklkIjoiNDk5NjM3IiwidHlwZUlkIjoiZWEwMzg5YzQtOWYxOC00NDc2LWJhMDgtMzdhZDgwNjY3ODI2IiwidHlwZSI6IlBST0pFQ1QiLCJpYXQiOjE3NjU0NzM4NzksImV4cCI6NDkyMTIzMzg3OX0.ck6-kSFlq3tqiGRLiNLXOLuqQwo-csFW0TCalhq0_lY';
 
 // ========== MIDDLEWARE ==========
 app.use(express.json());
@@ -112,12 +112,12 @@ async function generateBEP20Wallet() {
   }
 }
 
-// ========== ATOMIC DEPOSIT PROCESSING ==========
+// ========== DEPOSIT PROCESSING ==========
 async function processDeposit(wallet, amount, txid, network) {
   try {
     console.log(`💰 PROCESSING DEPOSIT: ${amount} USDT for user ${wallet.user_id}, txid: ${txid}, network: ${network}`);
 
-    // Проверяем существующий депозит
+    // Улучшенная проверка дубликатов (по хэшу И сети)
     const { data: existingDeposit, error: checkError } = await supabase
       .from('deposit_transactions')
       .select('id, status, amount, network')
@@ -133,25 +133,18 @@ async function processDeposit(wallet, amount, txid, network) {
     if (existingDeposit) {
       console.log(`✅ Deposit already processed: ${txid}, status: ${existingDeposit.status}, amount: ${existingDeposit.amount}`);
       
+      // Если депозит уже обработан, но статус не 'processed', обновим его
       if (existingDeposit.status !== 'processed') {
-        // Используем RPC функцию для атомарного обновления
-        const { data: result } = await supabase
-          .rpc('process_user_deposit', {
-            p_user_id: wallet.user_id,
-            p_amount: existingDeposit.amount,
-            p_tx_hash: txid,
-            p_network: network
-          });
-          
-        if (result && result.success) {
-          console.log(`🔄 Fixed deposit status: ${txid}`);
-        }
+        await supabase
+          .from('deposit_transactions')
+          .update({ status: 'processed' })
+          .eq('id', existingDeposit.id);
       }
       
       return { success: false, reason: 'already_processed', existing: existingDeposit };
     }
 
-    // Используем атомарную RPC функцию для обработки депозита
+    // Начинаем обработку депозита
     const depositResult = await processDepositTransaction(wallet, amount, txid, network);
     
     return depositResult;
@@ -161,12 +154,10 @@ async function processDeposit(wallet, amount, txid, network) {
   }
 }
 
-// Атомарная обработка депозита через PostgreSQL функцию
+// Новая функция для обработки депозита через PostgreSQL RPC
 async function processDepositTransaction(wallet, amount, txid, network) {
   try {
-    console.log(`🔄 Processing deposit via DB transaction: user ${wallet.user_id}, amount: ${amount}, txid: ${txid}`);
-    
-    // Вызываем RPC функцию для атомарной обработки
+    // Используем атомарную RPC функцию для обработки депозита
     const { data: result, error: rpcError } = await supabase
       .rpc('process_user_deposit', {
         p_user_id: wallet.user_id,
@@ -257,7 +248,9 @@ app.post('/api/deposit/generate', async (req, res) => {
     }).select().single();
 
     if (error) {
+      // Обработка ошибки дубликата при вставке
       if (error.code === '23505') {
+        // Кошелек был создан в другом потоке
         const { data: wallet } = await supabase
           .from('deposit_addresses')
           .select('address, private_key')
@@ -497,8 +490,9 @@ async function handleCheckTRC20Deposits() {
                 console.log(`💰 NEW TRC20 DEPOSIT: ${tx.amount} USDT for user ${wallet.user_id}`);
               }
             } catch (err) {
-              if (err.message.includes('already_processed') || 
-                  (err.reason && err.reason === 'already_processed')) {
+              if (err.message.includes('Duplicate deposit') || 
+                  err.message.includes('already_processed') || 
+                  (err.reason && err.reason === 'concurrent_processing')) {
                 duplicatesSkipped++;
                 console.log(`⏭️ Duplicate TRC20 deposit skipped: ${tx.transaction_id}`);
               } else {
@@ -568,8 +562,9 @@ async function handleCheckBEP20Deposits() {
                 console.log(`💰 NEW BEP20 DEPOSIT: ${tx.amount} USDT for user ${wallet.user_id}`);
               }
             } catch (err) {
-              if (err.message.includes('already_processed') || 
-                  (err.reason && err.reason === 'already_processed')) {
+              if (err.message.includes('Duplicate deposit') || 
+                  err.message.includes('already_processed') || 
+                  (err.reason && err.reason === 'concurrent_processing')) {
                 duplicatesSkipped++;
                 console.log(`⏭️ Duplicate BEP20 deposit skipped: ${tx.transaction_id}`);
               } else {
@@ -628,7 +623,7 @@ async function checkUserTRC20Deposits(userId) {
             console.log(`💰 FOUND NEW TRC20 DEPOSIT: ${tx.amount} USDT for user ${userId}`);
           }
         } catch (err) {
-          if (err.message.includes('already_processed') || err.reason === 'already_processed') {
+          if (err.message.includes('already_processed') || err.reason === 'concurrent_processing') {
             console.log(`⏭️ Duplicate TRC20 deposit for user ${userId}: ${tx.transaction_id}`);
           } else {
             console.error(`❌ Error processing transaction ${tx.transaction_id}:`, err);
@@ -675,7 +670,7 @@ async function checkUserBEP20Deposits(userId) {
             console.log(`💰 FOUND NEW BEP20 DEPOSIT: ${tx.amount} USDT for user ${userId}`);
           }
         } catch (err) {
-          if (err.message.includes('already_processed') || err.reason === 'already_processed') {
+          if (err.message.includes('already_processed') || err.reason === 'concurrent_processing') {
             console.log(`⏭️ Duplicate BEP20 deposit for user ${userId}: ${tx.transaction_id}`);
           } else {
             console.error(`❌ Error processing transaction ${tx.transaction_id}:`, err);
