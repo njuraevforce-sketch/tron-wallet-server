@@ -20,7 +20,7 @@ const SUPABASE_URL = process.env.SUPABASE_URL || 'https://fkjwueogfmdolcjtvvme.s
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const MORALIS_API_KEY = process.env.MORALIS_API_KEY || '';
 const ENCRYPTION_KEY = process.env.ENCRYPTION_KEY;
-const API_SECRET_KEY = process.env.API_SECRET_KEY || 'default-secret-key-change-me-123';
+const API_SECRET_KEY = process.env.API_SECRET_KEY;
 
 if (!SUPABASE_SERVICE_ROLE_KEY) {
   console.error('❌ Missing SUPABASE_SERVICE_ROLE_KEY env');
@@ -32,6 +32,10 @@ if (!ENCRYPTION_KEY || String(ENCRYPTION_KEY).length < 32) {
 }
 if (!MORALIS_API_KEY) {
   console.warn('⚠️ MORALIS_API_KEY is empty (BEP20/ERC20 checks may fail).');
+}
+if (!API_SECRET_KEY || String(API_SECRET_KEY).length < 32) {
+  console.error('❌ Missing/invalid API_SECRET_KEY env (must be 32+ chars)');
+  process.exit(1);
 }
 
 // ========== INITIALIZE SERVICES ==========
@@ -87,7 +91,7 @@ function simpleRateLimit(req, res, next) {
 app.use(simpleRateLimit);
 
 // ========== CONSTANTS ==========
-const MIN_DEPOSIT = 1;
+const MIN_DEPOSIT = 20;
 
 // BSC
 const USDT_BSC_CONTRACT = '0x55d398326f99059fF775485246999027B3197955';
@@ -187,7 +191,7 @@ async function safeSystemLog(logType, message, metadata = {}) {
 
 // ========== API KEY CHECK ==========
 function requireApiKey(req, res, next) {
-  const clientKey = req.headers['x-api-key'] || req.query.api_key;
+  const clientKey = req.headers['x-api-key'];
 
   if (!clientKey) {
     console.error('🚨 BLOCKED: No API key provided', {
@@ -197,7 +201,7 @@ function requireApiKey(req, res, next) {
     });
     return res.status(401).json({
       success: false,
-      error: 'API key required. Use x-api-key header or api_key query parameter.'
+      error: 'API key required. Use x-api-key header.'
     });
   }
 
@@ -304,22 +308,9 @@ async function generateWallet(user_id, network) {
     if (existingWallet && existingWallet[addressField]) {
       console.log(`✅ Wallet already exists: ${existingWallet[addressField]}`);
 
-      const { data: pkData } = await supabase
-        .from('private_keys')
-        .select('encrypted_private_key')
-        .eq('user_id', user_id)
-        .eq('network', network)
-        .maybeSingle();
-
-      let decryptedPrivateKey = null;
-      if (pkData?.encrypted_private_key) {
-        decryptedPrivateKey = decryptPrivateKey(pkData.encrypted_private_key);
-      }
-
       return {
         success: true,
         address: existingWallet[addressField],
-        private_key: decryptedPrivateKey || null,
         exists: true,
         network
       };
@@ -402,8 +393,6 @@ async function generateWallet(user_id, network) {
     return {
       success: true,
       address,
-      private_key: privateKey,
-      encrypted_stored: !!ENCRYPTION_KEY,
       exists: false,
       network
     };
@@ -899,31 +888,25 @@ app.post('/api/deposit/generate', requireApiKey, async (req, res) => {
 });
 
 // 2. Public/app endpoint
-// Keeps original compatibility (user_id in body/query), but if Bearer token is passed,
-// it validates the token and disallows mismatched user_id.
+// Requires Bearer auth and resolves user only from the token.
 app.post('/public/deposit/generate', async (req, res) => {
   try {
-    const requestedUserId = readParam(req, 'user_id');
     const network = readParam(req, 'network', 'usdt_bep20');
     const bearerUser = await getUserFromBearerToken(req);
-    const user_id = bearerUser?.id || requestedUserId;
 
     console.log('🔓 [PUBLIC] Deposit generation request:', {
-      requested_user_id: requestedUserId,
-      resolved_user_id: user_id,
+      resolved_user_id: bearerUser?.id || null,
       network,
       ip: req.ip,
       timestamp: new Date().toISOString(),
       bearer_auth: !!bearerUser
     });
 
-    if (!user_id) {
-      return res.status(400).json({ success: false, error: 'User ID is required' });
+    if (!bearerUser?.id) {
+      return res.status(401).json({ success: false, error: 'Auth required' });
     }
 
-    if (bearerUser && requestedUserId && requestedUserId !== bearerUser.id) {
-      return res.status(403).json({ success: false, error: 'Token user mismatch' });
-    }
+    const user_id = bearerUser.id;
 
     if (!allowedNetworks.includes(network)) {
       return res.status(400).json({ success: false, error: 'Unsupported network' });
@@ -952,7 +935,7 @@ app.post('/public/deposit/generate', async (req, res) => {
       network,
       address: result.address,
       ip: req.ip,
-      bearer_auth: !!bearerUser
+      bearer_auth: true
     });
 
     return res.json({
