@@ -1,8 +1,8 @@
-// server.js — Oracle Deposit System (BEP20 + ERC20 USDT/USDC)
+// server.js — Oracle Deposit System (BEP20 + ERC20 + TRC20 USDT/USDC)
 // Built from the user's original full server flow.
 // Changes vs original:
-// - TRC20 removed
-// - ERC20 added
+// - TRC20 restored for USDT
+// - ERC20 preserved
 // - Existing endpoint structure preserved
 // - Existing wallet generation + background check flow preserved
 // - Compatible with Supabase RPC public.create_deposit_with_balance
@@ -32,6 +32,9 @@ if (!ENCRYPTION_KEY || String(ENCRYPTION_KEY).length < 32) {
 }
 if (!MORALIS_API_KEY) {
   console.warn('⚠️ MORALIS_API_KEY is empty (BEP20/ERC20 checks may fail).');
+}
+if (!TRONGRID_API_KEY) {
+  console.warn('⚠️ TRONGRID_API_KEY is empty (TRC20 checks may hit strict public limits).');
 }
 if (!API_SECRET_KEY || String(API_SECRET_KEY).length < 32) {
   console.error('❌ Missing/invalid API_SECRET_KEY env (must be 32+ chars)');
@@ -101,6 +104,11 @@ const USDC_BSC_CONTRACT = '0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d';
 const USDT_ETH_CONTRACT = '0xdAC17F958D2ee523a2206206994597C13D831ec7';
 const USDC_ETH_CONTRACT = '0xA0b86991c6218b36c1d19d4a2e9eb0ce3606eb48';
 
+// TRON
+const USDT_TRON_CONTRACT = 'TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t';
+const TRONGRID_API_BASE = process.env.TRONGRID_API_BASE || 'https://api.trongrid.io';
+const TRONGRID_API_KEY = process.env.TRONGRID_API_KEY || '';
+
 const networkFields = {
   usdt_bep20: {
     addressField: 'usdt_bep20_address',
@@ -129,6 +137,13 @@ const networkFields = {
     contractAddress: USDC_ETH_CONTRACT,
     token: 'USDC',
     chain: 'eth'
+  },
+  usdt_trc20: {
+    addressField: 'usdt_trc20_address',
+    privateKeyField: 'usdt_trc20_private_key',
+    contractAddress: USDT_TRON_CONTRACT,
+    token: 'USDT',
+    chain: 'tron'
   }
 };
 
@@ -137,11 +152,55 @@ const allowedNetworks = Object.keys(networkFields);
 // ========== CHECK SETTINGS ==========
 const BEP20_CHECK_INTERVAL = Number(process.env.BEP20_CHECK_INTERVAL || 120000);
 const ERC20_CHECK_INTERVAL = Number(process.env.ERC20_CHECK_INTERVAL || 150000);
+const TRC20_CHECK_INTERVAL = Number(process.env.TRC20_CHECK_INTERVAL || 60000);
 const API_DELAY_MS = Number(process.env.API_DELAY_MS || 400);
 
 // ========== HELPERS ==========
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+const BASE58_ALPHABET = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
+
+function base58Encode(buffer) {
+  if (!buffer || !buffer.length) return '';
+
+  let value = BigInt('0x' + buffer.toString('hex'));
+  let encoded = '';
+
+  while (value > 0n) {
+    const mod = Number(value % 58n);
+    encoded = BASE58_ALPHABET[mod] + encoded;
+    value /= 58n;
+  }
+
+  for (const byte of buffer) {
+    if (byte === 0) encoded = '1' + encoded;
+    else break;
+  }
+
+  return encoded || '1';
+}
+
+function tronBase58CheckFromHex(hexAddress) {
+  const payload = Buffer.from(String(hexAddress || '').replace(/^0x/, ''), 'hex');
+  const hash1 = crypto.createHash('sha256').update(payload).digest();
+  const hash2 = crypto.createHash('sha256').update(hash1).digest();
+  const checksum = hash2.subarray(0, 4);
+  return base58Encode(Buffer.concat([payload, checksum]));
+}
+
+function generateTRONWallet() {
+  const wallet = ethers.Wallet.createRandom();
+  const ethHex = String(wallet.address || '').replace(/^0x/, '');
+  const tronHexAddress = '41' + ethHex;
+  const tronAddress = tronBase58CheckFromHex(tronHexAddress);
+
+  return {
+    address: tronAddress,
+    privateKey: wallet.privateKey,
+    hexAddress: tronHexAddress
+  };
 }
 
 function readParam(req, key, fallback = undefined) {
@@ -316,7 +375,7 @@ async function generateWallet(user_id, network) {
       };
     }
 
-    const wallet = await generateEVMWallet();
+    const wallet = network.endsWith('_trc20') ? generateTRONWallet() : await generateEVMWallet();
     const address = wallet.address;
     const privateKey = wallet.privateKey;
     const encryptedPrivateKey = encryptPrivateKey(privateKey);
@@ -386,6 +445,10 @@ async function generateWallet(user_id, network) {
       } else if (network.endsWith('_erc20')) {
         checkUserERC20Deposits(user_id).catch((err) => {
           console.error('❌ Deferred ERC20 check error:', err.message);
+        });
+      } else if (network.endsWith('_trc20')) {
+        checkUserTRC20Deposits(user_id).catch((err) => {
+          console.error('❌ Deferred TRC20 check error:', err.message);
         });
       }
     }, 10000);
@@ -612,6 +675,75 @@ async function getERC20Transactions(address) {
   return getChainTokenTransfers(address, 'eth');
 }
 
+async function getTRC20Transactions(address) {
+  try {
+    if (!address) return [];
+
+    const params = new URLSearchParams({
+      only_confirmed: 'true',
+      only_to: 'true',
+      limit: '200',
+      contract_address: USDT_TRON_CONTRACT
+    });
+
+    const headers = {
+      Accept: 'application/json'
+    };
+
+    if (TRONGRID_API_KEY) {
+      headers['TRON-PRO-API-KEY'] = TRONGRID_API_KEY;
+    }
+
+    const response = await fetch(`${TRONGRID_API_BASE}/v1/accounts/${encodeURIComponent(address)}/transactions/trc20?${params.toString()}`, {
+      headers
+    });
+
+    if (!response.ok) {
+      throw new Error(`TronGrid API error: ${response.status}`);
+    }
+
+    const data = await response.json();
+    const transactions = [];
+
+    for (const tx of data.data || []) {
+      try {
+        const toAddress = String(tx.to || '').trim();
+        if (toAddress !== String(address).trim()) continue;
+
+        const decimals = Number(tx.token_info?.decimals ?? tx.tokenInfo?.tokenDecimal ?? tx.decimals ?? 6);
+        const rawValue = tx.value ?? tx.amount ?? tx.quant ?? '0';
+        const amount = Number(rawValue) / Math.pow(10, decimals);
+        const tokenSymbol = String(tx.token_info?.symbol || tx.token_info?.name || tx.tokenName || 'USDT').toUpperCase();
+        const confirmed = tx.confirmed !== false;
+
+        if (tokenSymbol !== 'USDT') continue;
+        if (!confirmed) continue;
+        if (!Number.isFinite(amount) || amount < MIN_DEPOSIT) continue;
+
+        transactions.push({
+          transaction_id: String(tx.transaction_id || tx.hash || ''),
+          to: toAddress,
+          from: String(tx.from || '').trim(),
+          amount,
+          token: 'USDT',
+          confirmed: true,
+          network: 'usdt_trc20',
+          timestamp: Number(tx.block_timestamp || tx.blockTimeStamp || 0),
+          blockNumber: Number(tx.block_number || tx.block || 0)
+        });
+      } catch (innerErr) {
+        continue;
+      }
+    }
+
+    transactions.sort((a, b) => b.timestamp - a.timestamp);
+    return transactions;
+  } catch (error) {
+    console.error('❌ TRC20 transfer fetch error:', error.message);
+    return [];
+  }
+}
+
 // ========== CHAIN CHECKERS ==========
 async function handleCheckBEP20Deposits() {
   try {
@@ -770,6 +902,112 @@ async function handleCheckERC20Deposits() {
   } catch (error) {
     console.error('❌ ERC20 check error:', error.message);
     return { success: false, error: error.message };
+  }
+}
+
+async function handleCheckTRC20Deposits() {
+  try {
+    console.log('🔄 Checking TRC20 deposits...');
+
+    const { data: wallets, error } = await supabase
+      .from('user_wallets')
+      .select('*')
+      .not('usdt_trc20_address', 'is', null)
+      .limit(200);
+
+    if (error) throw error;
+
+    let processedCount = 0;
+    let depositsFound = 0;
+    let duplicatesSkipped = 0;
+    let errors = 0;
+
+    for (const wallet of wallets || []) {
+      try {
+        const addresses = Array.from(new Set([wallet.usdt_trc20_address].filter(Boolean)));
+
+        for (const address of addresses) {
+          await sleep(API_DELAY_MS);
+
+          const transactions = await getTRC20Transactions(address);
+          for (const tx of transactions) {
+            try {
+              const { data: existing } = await supabase
+                .from('deposit_requests')
+                .select('id, status')
+                .eq('tx_hash', tx.transaction_id)
+                .eq('network', tx.network)
+                .maybeSingle();
+
+              if (existing && existing.status === 'completed') {
+                duplicatesSkipped++;
+                console.log(`⏭️ Skipping duplicate ${tx.network} transaction: ${tx.transaction_id}`);
+                continue;
+              }
+
+              const result = await processDeposit(wallet.user_id, tx.amount, tx.transaction_id, tx.network);
+              if (result.success) {
+                depositsFound++;
+                console.log(`💰 NEW ${tx.network} DEPOSIT: $${tx.amount} ${tx.token} for user ${wallet.user_id}`);
+              }
+            } catch (err) {
+              if (String(err.message || '').includes('already_processed') || String(err.message || '').includes('duplicate')) {
+                duplicatesSkipped++;
+                console.log(`⏭️ Duplicate ${tx.network} deposit skipped: ${tx.transaction_id}`);
+              } else {
+                console.error(`❌ Error processing ${tx.network} deposit ${tx.transaction_id}:`, err.message);
+                errors++;
+              }
+            }
+          }
+        }
+
+        processedCount++;
+      } catch (err) {
+        console.error(`❌ Error processing TRC20 wallet ${wallet.user_id}:`, err.message);
+        errors++;
+      }
+    }
+
+    console.log(`✅ TRC20: Processed ${processedCount} wallets, found ${depositsFound} new deposits, skipped ${duplicatesSkipped} duplicates, errors: ${errors}`);
+    return {
+      success: true,
+      processed: processedCount,
+      deposits: depositsFound,
+      duplicates: duplicatesSkipped,
+      errors
+    };
+  } catch (error) {
+    console.error('❌ TRC20 check error:', error.message);
+    return { success: false, error: error.message };
+  }
+}
+
+async function checkUserTRC20Deposits(userId) {
+  try {
+    const { data: wallet, error } = await supabase
+      .from('user_wallets')
+      .select('*')
+      .eq('user_id', userId)
+      .maybeSingle();
+
+    if (error) throw error;
+    if (!wallet) return;
+
+    const addresses = Array.from(new Set([wallet.usdt_trc20_address].filter(Boolean)));
+
+    for (const address of addresses) {
+      const transactions = await getTRC20Transactions(address);
+      for (const tx of transactions) {
+        try {
+          await processDeposit(userId, tx.amount, tx.transaction_id, tx.network);
+        } catch (err) {
+          console.error(`❌ Error processing transaction ${tx.transaction_id}:`, err.message);
+        }
+      }
+    }
+  } catch (error) {
+    console.error('❌ checkUserTRC20Deposits error:', error.message);
   }
 }
 
@@ -997,11 +1235,13 @@ app.get('/api/check-deposits', requireApiKey, async (req, res) => {
     console.log('🔄 [SECURE] Manual deposit check triggered via API');
     const bep20Result = await handleCheckBEP20Deposits();
     const erc20Result = await handleCheckERC20Deposits();
+    const trc20Result = await handleCheckTRC20Deposits();
 
     return res.json({
       success: true,
       bep20: bep20Result,
-      erc20: erc20Result
+      erc20: erc20Result,
+      trc20: trc20Result
     });
   } catch (error) {
     return res.status(500).json({ success: false, error: error.message });
@@ -1022,6 +1262,7 @@ const server = app.listen(PORT, '0.0.0.0', () => {
   console.log(`✅ MORALIS: ${MORALIS_API_KEY ? 'API KEY SET' : 'API KEY MISSING'}`);
   console.log(`✅ BEP20 (USDT & USDC): Checking every ${BEP20_CHECK_INTERVAL} ms`);
   console.log(`✅ ERC20 (USDT & USDC): Checking every ${ERC20_CHECK_INTERVAL} ms`);
+  console.log(`✅ TRC20 (USDT): Checking every ${TRC20_CHECK_INTERVAL} ms`);
   console.log(`✅ MINIMUM DEPOSIT: $${MIN_DEPOSIT}`);
   console.log(`✅ PRIVATE KEY ENCRYPTION: ${ENCRYPTION_KEY ? 'AES-256-GCM ENABLED' : 'DISABLED'}`);
   console.log(`✅ ATOMIC DEPOSITS: ENABLED`);
@@ -1032,6 +1273,7 @@ const server = app.listen(PORT, '0.0.0.0', () => {
 // ========== BACKGROUND TASKS ==========
 let isCheckingBEP20 = false;
 let isCheckingERC20 = false;
+let isCheckingTRC20 = false;
 
 setInterval(async () => {
   if (isCheckingBEP20) return;
@@ -1058,6 +1300,19 @@ setInterval(async () => {
     isCheckingERC20 = false;
   }
 }, ERC20_CHECK_INTERVAL);
+
+setInterval(async () => {
+  if (isCheckingTRC20) return;
+
+  try {
+    isCheckingTRC20 = true;
+    await handleCheckTRC20Deposits();
+  } catch (err) {
+    console.error('❌ TRC20 auto-check error:', err.message);
+  } finally {
+    isCheckingTRC20 = false;
+  }
+}, TRC20_CHECK_INTERVAL);
 
 process.on('SIGTERM', () => {
   console.log('🛑 Received SIGTERM, shutting down gracefully');
