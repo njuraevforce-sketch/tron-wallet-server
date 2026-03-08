@@ -33,9 +33,6 @@ if (!ENCRYPTION_KEY || String(ENCRYPTION_KEY).length < 32) {
 if (!MORALIS_API_KEY) {
   console.warn('⚠️ MORALIS_API_KEY is empty (BEP20/ERC20 checks may fail).');
 }
-if (!TRONGRID_API_KEY) {
-  console.warn('⚠️ TRONGRID_API_KEY is empty (TRC20 checks may hit strict public limits).');
-}
 if (!API_SECRET_KEY || String(API_SECRET_KEY).length < 32) {
   console.error('❌ Missing/invalid API_SECRET_KEY env (must be 32+ chars)');
   process.exit(1);
@@ -108,6 +105,9 @@ const USDC_ETH_CONTRACT = '0xA0b86991c6218b36c1d19d4a2e9eb0ce3606eb48';
 const USDT_TRON_CONTRACT = 'TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t';
 const TRONGRID_API_BASE = process.env.TRONGRID_API_BASE || 'https://api.trongrid.io';
 const TRONGRID_API_KEY = process.env.TRONGRID_API_KEY || '';
+if (!TRONGRID_API_KEY) {
+  console.warn('⚠️ TRONGRID_API_KEY is empty (TRC20 checks may hit strict public limits).');
+}
 
 const networkFields = {
   usdt_bep20: {
