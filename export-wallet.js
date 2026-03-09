@@ -12,7 +12,7 @@ const ALLOWED_NETWORKS = new Set([
   'usdt_erc20',
   'usdc_erc20',
   'trx',
-  'trc20',
+  'usdt_trc20',
   'trc_20',
 ]);
 
