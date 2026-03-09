@@ -13,6 +13,7 @@ const ALLOWED_NETWORKS = new Set([
   'usdc_erc20',
   'trx',
   'trc20',
+  'trc_20',
 ]);
 
 function fail(message, code = 1) {
