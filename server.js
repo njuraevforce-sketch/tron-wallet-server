@@ -633,14 +633,16 @@ async function getChainTokenTransfers(address, chain) {
         if (toAddress !== String(address).toLowerCase()) continue;
 
         const tokenSymbol = String(tx.token_symbol || '').toUpperCase();
-        if (tokenSymbol !== 'USDT' && tokenSymbol !== 'USDC') continue;
+        
+        // РАЗРЕШАЕМ BSC-USD ЗДЕСЬ
+        if (tokenSymbol !== 'USDT' && tokenSymbol !== 'USDC' && tokenSymbol !== 'BSC-USD') continue;
 
         const decimals = Number(tx.decimals || 18);
         const amount = Number(tx.value) / Math.pow(10, decimals);
         if (!Number.isFinite(amount) || amount < MIN_DEPOSIT) continue;
 
         const network = chain === 'bsc'
-          ? (tokenSymbol === 'USDT' ? 'usdt_bep20' : 'usdc_bep20')
+          ? ((tokenSymbol === 'USDT' || tokenSymbol === 'BSC-USD') ? 'usdt_bep20' : 'usdc_bep20')
           : (tokenSymbol === 'USDT' ? 'usdt_erc20' : 'usdc_erc20');
 
         transactions.push({
@@ -648,7 +650,8 @@ async function getChainTokenTransfers(address, chain) {
           to: toAddress,
           from: String(tx.from_address || '').toLowerCase(),
           amount,
-          token: tokenSymbol,
+          // ПЕРЕИМЕНОВЫВАЕМ ОБРАТНО В USDT ДЛЯ БАЗЫ И ЛОГОВ
+          token: tokenSymbol === 'BSC-USD' ? 'USDT' : tokenSymbol,
           confirmed: true,
           network,
           timestamp: new Date(tx.block_timestamp).getTime(),
