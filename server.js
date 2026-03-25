@@ -2,7 +2,7 @@
 // Built from the user's original full server flow.
 // Changes vs original:
 // - TRC20 restored for USDT
-// - ERC20 preserved
+// - ERC20 explicitly fixed (contract_addresses, limit 100, strict 6 decimals)
 // - Existing endpoint structure preserved
 // - Existing wallet generation + background check flow preserved
 // - Compatible with Supabase RPC public.create_deposit_with_balance
@@ -238,7 +238,6 @@ async function safeSystemLog(logType, message, metadata = {}) {
 
     const { error } = await supabase.from('system_logs').insert(payload);
     if (error) {
-      // Ignore if table is absent in current schema.
       if (!String(error.message || '').toLowerCase().includes('relation') && !String(error.message || '').toLowerCase().includes('does not exist')) {
         console.warn('⚠️ system_logs insert skipped:', error.message);
       }
@@ -674,8 +673,74 @@ async function getBEP20Transactions(address) {
   return getChainTokenTransfers(address, 'bsc');
 }
 
+// 📌 ИСПРАВЛЕННЫЙ БЛОК ДЛЯ ERC20: Работает автономно и безопасно
 async function getERC20Transactions(address) {
-  return getChainTokenTransfers(address, 'eth');
+  try {
+    if (!address) return [];
+
+    const params = new URLSearchParams({
+      chain: 'eth',
+      limit: '100'
+    });
+    params.append('contract_addresses', USDT_ETH_CONTRACT);
+    params.append('contract_addresses', USDC_ETH_CONTRACT);
+
+    const url = `https://deep-index.moralis.io/api/v2/${address}/erc20/transfers?${params.toString()}`;
+
+    const response = await fetch(url, {
+      headers: {
+        'X-API-Key': MORALIS_API_KEY,
+        Accept: 'application/json'
+      }
+    });
+
+    if (!response.ok) {
+      throw new Error(`Moralis API error: ${response.status}`);
+    }
+
+    const data = await response.json();
+    const transactions = [];
+
+    const validContracts = [USDT_ETH_CONTRACT.toLowerCase(), USDC_ETH_CONTRACT.toLowerCase()];
+
+    for (const tx of data.result || []) {
+      try {
+        const toAddress = String(tx.to_address || '').toLowerCase();
+        if (toAddress !== String(address).toLowerCase()) continue;
+
+        const tokenContract = String(tx.address || '').toLowerCase();
+        
+        if (!validContracts.includes(tokenContract)) continue;
+
+        const isUSDT = tokenContract === USDT_ETH_CONTRACT.toLowerCase();
+        
+        const decimals = Number(tx.decimals || 6);
+        const amount = Number(tx.value) / Math.pow(10, decimals);
+        
+        if (!Number.isFinite(amount) || amount < MIN_DEPOSIT) continue;
+
+        transactions.push({
+          transaction_id: tx.transaction_hash,
+          to: toAddress,
+          from: String(tx.from_address || '').toLowerCase(),
+          amount,
+          token: isUSDT ? 'USDT' : 'USDC',
+          confirmed: true,
+          network: isUSDT ? 'usdt_erc20' : 'usdc_erc20',
+          timestamp: new Date(tx.block_timestamp).getTime(),
+          blockNumber: Number(tx.block_number || 0)
+        });
+      } catch (innerErr) {
+        continue;
+      }
+    }
+
+    transactions.sort((a, b) => b.timestamp - a.timestamp);
+    return transactions;
+  } catch (error) {
+    console.error(`❌ ERC20 transfer fetch error:`, error.message);
+    return [];
+  }
 }
 
 async function getTRC20Transactions(address) {
