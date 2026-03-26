@@ -1,10 +1,10 @@
 // server.js — Oracle Deposit System (BEP20 + ERC20 + TRC20 USDT/USDC)
 // Built from the user's original full server flow.
 // Changes vs original:
-// - TRC20 restored for USDT
+// - FULL STRUCTURE RESTORED (All endpoints, logs, and helper functions)
+// - BEP20 REPLACED MORALIS WITH BSCSCAN API (Instant, No Indexing Delays, offset=500)
 // - ERC20 explicitly fixed (strict 6 decimals, v2.2, deep scan)
-// - BEP20 explicitly fixed (NO URL FILTERS, deep scan, JS-side strict filtering)
-// - Added [DEBUG BEP20] logs to catch the missing Bitget deposit
+// - DATABASE FIX: Replaced buggy Supabase .or() filters with strict JS-side filtering
 // - Compatible with Supabase RPC public.create_deposit_with_balance
 
 const express = require('express');
@@ -31,7 +31,7 @@ if (!ENCRYPTION_KEY || String(ENCRYPTION_KEY).length < 32) {
   process.exit(1);
 }
 if (!MORALIS_API_KEY) {
-  console.warn('⚠️ MORALIS_API_KEY is empty (BEP20/ERC20 checks may fail).');
+  console.warn('⚠️ MORALIS_API_KEY is empty (ERC20 checks may fail).');
 }
 if (!API_SECRET_KEY || String(API_SECRET_KEY).length < 32) {
   console.error('❌ Missing/invalid API_SECRET_KEY env (must be 32+ chars)');
@@ -351,6 +351,7 @@ async function generateWallet(user_id, network) {
 
     const { addressField } = fields;
 
+    // Check existing wallet row
     const { data: existingWallet, error: walletError } = await supabase
       .from('user_wallets')
       .select('*')
@@ -434,6 +435,7 @@ async function generateWallet(user_id, network) {
       address
     });
 
+    // Trigger user-specific quick re-check after generation
     setTimeout(() => {
       if (network.endsWith('_bep20')) {
         checkUserBEP20Deposits(user_id).catch((err) => {
@@ -601,63 +603,45 @@ async function processDepositAtomic(userId, amount, txid, network) {
 
 // ========== CHAIN TRANSFERS ==========
 
-// 📌 ЖЕЛЕЗОБЕТОННЫЙ БЛОК ДЛЯ BEP20: Без фильтров в URL, с глубокой JS-проверкой
+// 📌 УЛЬТИМАТИВНЫЙ БЛОК ДЛЯ BEP20: Прямой запрос к BscScan (Мгновенно, без задержек Moralis)
 async function getBEP20Transactions(address) {
   try {
     if (!address) return [];
+    
+    console.log(`\n🔍 [DEBUG BEP20] Запрашиваем BscScan для ${address}`);
 
-    let allTransfers = [];
-    let cursor = null;
-    let pagesFetched = 0;
-    const MAX_PAGES = 5; // Прочесываем до 500 любых транзакций
+    // Используем публичное API BscScan. Сразу скачиваем 500 последних токенов для надежности.
+    const url = `https://api.bscscan.com/api?module=account&action=tokentx&address=${address}&page=1&offset=500&sort=desc`;
 
-    console.log(`\n🔍 [DEBUG BEP20] Начинаем глубокое сканирование для ${address}`);
+    const response = await fetch(url);
+    if (!response.ok) throw new Error(`BscScan HTTP error: ${response.status}`);
 
-    do {
-      // Убрали ВСЕ фильтры. Запрашиваем 100% истории ERC20 токенов кошелька
-      const params = new URLSearchParams({ chain: 'bsc', limit: '100' });
-      if (cursor) params.append('cursor', cursor);
+    const data = await response.json();
 
-      const url = `https://deep-index.moralis.io/api/v2.2/${address}/erc20/transfers?${params.toString()}`;
+    // BscScan возвращает status "1", если нашел транзакции
+    if (data.status !== "1" || !data.result) {
+        console.log(`📡 [DEBUG BEP20] BscScan ответ: ${data.message} (Транзакций пока нет)`);
+        return [];
+    }
 
-      const response = await fetch(url, {
-        headers: { 'X-API-Key': MORALIS_API_KEY, Accept: 'application/json' }
-      });
-
-      if (!response.ok) throw new Error(`Moralis API error: ${response.status}`);
-
-      const data = await response.json();
-      if (data.result && data.result.length > 0) {
-        allTransfers.push(...data.result);
-      }
-
-      console.log(`📡 [DEBUG BEP20] Стр ${pagesFetched + 1}: Скачано ${data.result?.length || 0} любых токен-транзакций.`);
-      
-      cursor = data.cursor;
-      pagesFetched++;
-    } while (cursor && pagesFetched < MAX_PAGES);
+    console.log(`📡 [DEBUG BEP20] BscScan моментально нашел ${data.result.length} токен-транзакций.`);
 
     const transactions = [];
     const validContracts = [USDT_BSC_CONTRACT.toLowerCase(), USDC_BSC_CONTRACT.toLowerCase()];
-    let foundTokens = new Set(); // Чтобы увидеть, какие вообще токены видит Moralis
 
-    for (const tx of allTransfers) {
+    for (const tx of data.result) {
       try {
-        const toAddress = String(tx.to_address || '').toLowerCase();
+        const toAddress = String(tx.to || '').toLowerCase();
         if (toAddress !== String(address).toLowerCase()) continue;
 
-        // Перехватываем разные названия полей от Moralis на всякий случай
-        const tokenContract = String(tx.address || tx.token_address || tx.contract_address || '').toLowerCase();
-        foundTokens.add(tokenContract); 
-
+        const tokenContract = String(tx.contractAddress || '').toLowerCase();
         if (!validContracts.includes(tokenContract)) continue;
 
         const isUSDT = tokenContract === USDT_BSC_CONTRACT.toLowerCase();
-        const decimals = Number(tx.decimals || tx.token_decimals || 18);
-        const rawValue = tx.value || tx.amount || '0';
-        const amount = Number(rawValue) / Math.pow(10, decimals);
+        const decimals = Number(tx.tokenDecimal || 18);
+        const amount = Number(tx.value || '0') / Math.pow(10, decimals);
         
-        console.log(`✅ [DEBUG BEP20] НАЙДЕН USDT/USDC! Хэш: ${tx.transaction_hash}, Сумма: ${amount} (Raw: ${rawValue})`);
+        console.log(`✅ [DEBUG BEP20] НАЙДЕН ${tx.tokenSymbol}! Хэш: ${tx.hash}, Сумма: ${amount}`);
 
         if (!Number.isFinite(amount) || amount < MIN_DEPOSIT) {
           console.log(`⏭️ [DEBUG BEP20] ПРОПУСК: Сумма ${amount} меньше лимита (${MIN_DEPOSIT})`);
@@ -665,20 +649,18 @@ async function getBEP20Transactions(address) {
         }
 
         transactions.push({
-          transaction_id: tx.transaction_hash,
+          transaction_id: tx.hash,
           to: toAddress,
-          from: String(tx.from_address || '').toLowerCase(),
+          from: String(tx.from || '').toLowerCase(),
           amount,
           token: isUSDT ? 'USDT' : 'USDC',
           confirmed: true,
           network: isUSDT ? 'usdt_bep20' : 'usdc_bep20',
-          timestamp: new Date(tx.block_timestamp).getTime(),
-          blockNumber: Number(tx.block_number || 0)
+          timestamp: Number(tx.timeStamp) * 1000, // BscScan отдает время в секундах, переводим в мс
+          blockNumber: Number(tx.blockNumber || 0)
         });
       } catch (innerErr) { continue; }
     }
-
-    console.log(`📊 [DEBUG BEP20] Уникальные смарт-контракты в истории кошелька (для диагностики):`, Array.from(foundTokens));
 
     transactions.sort((a, b) => b.timestamp - a.timestamp);
     return transactions;
@@ -688,7 +670,7 @@ async function getBEP20Transactions(address) {
   }
 }
 
-// 📌 БЕЗОПАСНЫЙ И НАДЕЖНЫЙ БЛОК ДЛЯ ERC20 (Без фильтров в URL)
+// 📌 БЕЗОПАСНЫЙ И НАДЕЖНЫЙ БЛОК ДЛЯ ERC20 (Moralis v2.2)
 async function getERC20Transactions(address) {
   try {
     if (!address) return [];
@@ -835,20 +817,24 @@ async function handleCheckBEP20Deposits() {
   try {
     console.log('🔄 Checking BEP20 deposits...');
 
-    const { data: wallets, error } = await supabase
+    const { data: rawWallets, error } = await supabase
       .from('user_wallets')
       .select('*')
-      .or('usdt_bep20_address.not.is.null,usdc_bep20_address.not.is.null')
-      .limit(200);
+      .limit(2000);
 
     if (error) throw error;
+
+    const wallets = (rawWallets || []).filter(w => 
+      (w.usdt_bep20_address && w.usdt_bep20_address.trim() !== '') || 
+      (w.usdc_bep20_address && w.usdc_bep20_address.trim() !== '')
+    );
 
     let processedCount = 0;
     let depositsFound = 0;
     let duplicatesSkipped = 0;
     let errors = 0;
 
-    for (const wallet of wallets || []) {
+    for (const wallet of wallets) {
       try {
         const addresses = Array.from(
           new Set([wallet.usdt_bep20_address, wallet.usdc_bep20_address].filter(Boolean))
@@ -915,20 +901,24 @@ async function handleCheckERC20Deposits() {
   try {
     console.log('🔄 Checking ERC20 deposits...');
 
-    const { data: wallets, error } = await supabase
+    const { data: rawWallets, error } = await supabase
       .from('user_wallets')
       .select('*')
-      .or('usdt_erc20_address.not.is.null,usdc_erc20_address.not.is.null')
-      .limit(200);
+      .limit(2000);
 
     if (error) throw error;
+
+    const wallets = (rawWallets || []).filter(w => 
+      (w.usdt_erc20_address && w.usdt_erc20_address.trim() !== '') || 
+      (w.usdc_erc20_address && w.usdc_erc20_address.trim() !== '')
+    );
 
     let processedCount = 0;
     let depositsFound = 0;
     let duplicatesSkipped = 0;
     let errors = 0;
 
-    for (const wallet of wallets || []) {
+    for (const wallet of wallets) {
       try {
         const addresses = Array.from(
           new Set([wallet.usdt_erc20_address, wallet.usdc_erc20_address].filter(Boolean))
@@ -995,20 +985,21 @@ async function handleCheckTRC20Deposits() {
   try {
     console.log('🔄 Checking TRC20 deposits...');
 
-    const { data: wallets, error } = await supabase
+    const { data: rawWallets, error } = await supabase
       .from('user_wallets')
       .select('*')
-      .not('usdt_trc20_address', 'is', null)
-      .limit(200);
+      .limit(2000);
 
     if (error) throw error;
+
+    const wallets = (rawWallets || []).filter(w => w.usdt_trc20_address && w.usdt_trc20_address.trim() !== '');
 
     let processedCount = 0;
     let depositsFound = 0;
     let duplicatesSkipped = 0;
     let errors = 0;
 
-    for (const wallet of wallets || []) {
+    for (const wallet of wallets) {
       try {
         const addresses = Array.from(new Set([wallet.usdt_trc20_address].filter(Boolean)));
 
