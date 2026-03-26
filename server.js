@@ -2,8 +2,8 @@
 // Built from the user's original full server flow.
 // Changes vs original:
 // - TRC20 restored for USDT
-// - ERC20 explicitly fixed (contract_addresses, limit 100, strict 6 decimals)
-// - BEP20 explicitly fixed (contract_addresses, limit 100, strict 18 decimals)
+// - ERC20 explicitly fixed (contract_addresses, limit 100, strict 6 decimals, v2.2, deep scan)
+// - BEP20 explicitly fixed (contract_addresses, limit 100, strict 18 decimals, v2.2, deep scan)
 // - Old vulnerable getChainTokenTransfers removed completely
 // - Compatible with Supabase RPC public.create_deposit_with_balance
 
@@ -603,37 +603,54 @@ async function processDepositAtomic(userId, amount, txid, network) {
 
 // ========== CHAIN TRANSFERS ==========
 
-// 📌 ИСПРАВЛЕННЫЙ БЛОК ДЛЯ BEP20: Работает автономно и безопасно
+// 📌 ИСПРАВЛЕННЫЙ БЛОК ДЛЯ BEP20: Глубокое сканирование и API v2.2
 async function getBEP20Transactions(address) {
   try {
     if (!address) return [];
 
-    const params = new URLSearchParams({
-      chain: 'bsc',
-      limit: '100'
-    });
-    params.append('contract_addresses', USDT_BSC_CONTRACT);
-    params.append('contract_addresses', USDC_BSC_CONTRACT);
+    let allTransfers = [];
+    let cursor = null;
+    let pagesFetched = 0;
+    const MAX_PAGES = 5; // Загружаем до 500 транзакций для обхода спама
 
-    const url = `https://deep-index.moralis.io/api/v2/${address}/erc20/transfers?${params.toString()}`;
-
-    const response = await fetch(url, {
-      headers: {
-        'X-API-Key': MORALIS_API_KEY,
-        Accept: 'application/json'
+    do {
+      const params = new URLSearchParams({
+        chain: 'bsc',
+        limit: '100'
+      });
+      params.append('contract_addresses', USDT_BSC_CONTRACT);
+      params.append('contract_addresses', USDC_BSC_CONTRACT);
+      if (cursor) {
+        params.append('cursor', cursor);
       }
-    });
 
-    if (!response.ok) {
-      throw new Error(`Moralis API error: ${response.status}`);
-    }
+      // Перешли на стабильный v2.2
+      const url = `https://deep-index.moralis.io/api/v2.2/${address}/erc20/transfers?${params.toString()}`;
 
-    const data = await response.json();
+      const response = await fetch(url, {
+        headers: {
+          'X-API-Key': MORALIS_API_KEY,
+          Accept: 'application/json'
+        }
+      });
+
+      if (!response.ok) {
+        throw new Error(`Moralis API error: ${response.status}`);
+      }
+
+      const data = await response.json();
+      if (data.result && data.result.length > 0) {
+        allTransfers.push(...data.result);
+      }
+
+      cursor = data.cursor;
+      pagesFetched++;
+    } while (cursor && pagesFetched < MAX_PAGES);
+
     const transactions = [];
-
     const validContracts = [USDT_BSC_CONTRACT.toLowerCase(), USDC_BSC_CONTRACT.toLowerCase()];
 
-    for (const tx of data.result || []) {
+    for (const tx of allTransfers) {
       try {
         const toAddress = String(tx.to_address || '').toLowerCase();
         if (toAddress !== String(address).toLowerCase()) continue;
@@ -644,7 +661,6 @@ async function getBEP20Transactions(address) {
 
         const isUSDT = tokenContract === USDT_BSC_CONTRACT.toLowerCase();
         
-        // BSC использует 18 нулей
         const decimals = Number(tx.decimals || 18);
         const amount = Number(tx.value) / Math.pow(10, decimals);
         
@@ -674,37 +690,53 @@ async function getBEP20Transactions(address) {
   }
 }
 
-// 📌 ИСПРАВЛЕННЫЙ БЛОК ДЛЯ ERC20: Работает автономно и безопасно
+// 📌 ИСПРАВЛЕННЫЙ БЛОК ДЛЯ ERC20: Глубокое сканирование и API v2.2
 async function getERC20Transactions(address) {
   try {
     if (!address) return [];
 
-    const params = new URLSearchParams({
-      chain: 'eth',
-      limit: '100'
-    });
-    params.append('contract_addresses', USDT_ETH_CONTRACT);
-    params.append('contract_addresses', USDC_ETH_CONTRACT);
+    let allTransfers = [];
+    let cursor = null;
+    let pagesFetched = 0;
+    const MAX_PAGES = 5; 
 
-    const url = `https://deep-index.moralis.io/api/v2/${address}/erc20/transfers?${params.toString()}`;
-
-    const response = await fetch(url, {
-      headers: {
-        'X-API-Key': MORALIS_API_KEY,
-        Accept: 'application/json'
+    do {
+      const params = new URLSearchParams({
+        chain: 'eth',
+        limit: '100'
+      });
+      params.append('contract_addresses', USDT_ETH_CONTRACT);
+      params.append('contract_addresses', USDC_ETH_CONTRACT);
+      if (cursor) {
+        params.append('cursor', cursor);
       }
-    });
 
-    if (!response.ok) {
-      throw new Error(`Moralis API error: ${response.status}`);
-    }
+      const url = `https://deep-index.moralis.io/api/v2.2/${address}/erc20/transfers?${params.toString()}`;
 
-    const data = await response.json();
+      const response = await fetch(url, {
+        headers: {
+          'X-API-Key': MORALIS_API_KEY,
+          Accept: 'application/json'
+        }
+      });
+
+      if (!response.ok) {
+        throw new Error(`Moralis API error: ${response.status}`);
+      }
+
+      const data = await response.json();
+      if (data.result && data.result.length > 0) {
+        allTransfers.push(...data.result);
+      }
+
+      cursor = data.cursor;
+      pagesFetched++;
+    } while (cursor && pagesFetched < MAX_PAGES);
+
     const transactions = [];
-
     const validContracts = [USDT_ETH_CONTRACT.toLowerCase(), USDC_ETH_CONTRACT.toLowerCase()];
 
-    for (const tx of data.result || []) {
+    for (const tx of allTransfers) {
       try {
         const toAddress = String(tx.to_address || '').toLowerCase();
         if (toAddress !== String(address).toLowerCase()) continue;
@@ -1195,7 +1227,6 @@ app.post('/api/deposit/generate', requireApiKey, async (req, res) => {
 });
 
 // 2. Public/app endpoint
-// Requires Bearer auth and resolves user only from the token.
 app.post('/public/deposit/generate', async (req, res) => {
   try {
     const network = readParam(req, 'network', 'usdt_bep20');
