@@ -3,8 +3,8 @@
 // Changes vs original:
 // - TRC20 restored for USDT
 // - ERC20 explicitly fixed (contract_addresses, limit 100, strict 6 decimals)
-// - Existing endpoint structure preserved
-// - Existing wallet generation + background check flow preserved
+// - BEP20 explicitly fixed (contract_addresses, limit 100, strict 18 decimals)
+// - Old vulnerable getChainTokenTransfers removed completely
 // - Compatible with Supabase RPC public.create_deposit_with_balance
 
 const express = require('express');
@@ -602,15 +602,20 @@ async function processDepositAtomic(userId, amount, txid, network) {
 }
 
 // ========== CHAIN TRANSFERS ==========
-async function getChainTokenTransfers(address, chain) {
+
+// 📌 ИСПРАВЛЕННЫЙ БЛОК ДЛЯ BEP20: Работает автономно и безопасно
+async function getBEP20Transactions(address) {
   try {
     if (!address) return [];
 
-    const tokenAddresses = chain === 'bsc'
-      ? [USDT_BSC_CONTRACT, USDC_BSC_CONTRACT]
-      : [USDT_ETH_CONTRACT, USDC_ETH_CONTRACT];
+    const params = new URLSearchParams({
+      chain: 'bsc',
+      limit: '100'
+    });
+    params.append('contract_addresses', USDT_BSC_CONTRACT);
+    params.append('contract_addresses', USDC_BSC_CONTRACT);
 
-    const url = `https://deep-index.moralis.io/api/v2/${address}/erc20/transfers?chain=${chain}&token_addresses=${tokenAddresses.join(',')}&limit=20`;
+    const url = `https://deep-index.moralis.io/api/v2/${address}/erc20/transfers?${params.toString()}`;
 
     const response = await fetch(url, {
       headers: {
@@ -626,33 +631,33 @@ async function getChainTokenTransfers(address, chain) {
     const data = await response.json();
     const transactions = [];
 
+    const validContracts = [USDT_BSC_CONTRACT.toLowerCase(), USDC_BSC_CONTRACT.toLowerCase()];
+
     for (const tx of data.result || []) {
       try {
         const toAddress = String(tx.to_address || '').toLowerCase();
         if (toAddress !== String(address).toLowerCase()) continue;
 
-        const tokenSymbol = String(tx.token_symbol || '').toUpperCase();
+        const tokenContract = String(tx.address || '').toLowerCase();
         
-        // РАЗРЕШАЕМ BSC-USD ЗДЕСЬ
-        if (tokenSymbol !== 'USDT' && tokenSymbol !== 'USDC' && tokenSymbol !== 'BSC-USD') continue;
+        if (!validContracts.includes(tokenContract)) continue;
 
+        const isUSDT = tokenContract === USDT_BSC_CONTRACT.toLowerCase();
+        
+        // BSC использует 18 нулей
         const decimals = Number(tx.decimals || 18);
         const amount = Number(tx.value) / Math.pow(10, decimals);
+        
         if (!Number.isFinite(amount) || amount < MIN_DEPOSIT) continue;
-
-        const network = chain === 'bsc'
-          ? ((tokenSymbol === 'USDT' || tokenSymbol === 'BSC-USD') ? 'usdt_bep20' : 'usdc_bep20')
-          : (tokenSymbol === 'USDT' ? 'usdt_erc20' : 'usdc_erc20');
 
         transactions.push({
           transaction_id: tx.transaction_hash,
           to: toAddress,
           from: String(tx.from_address || '').toLowerCase(),
           amount,
-          // ПЕРЕИМЕНОВЫВАЕМ ОБРАТНО В USDT ДЛЯ БАЗЫ И ЛОГОВ
-          token: tokenSymbol === 'BSC-USD' ? 'USDT' : tokenSymbol,
+          token: isUSDT ? 'USDT' : 'USDC',
           confirmed: true,
-          network,
+          network: isUSDT ? 'usdt_bep20' : 'usdc_bep20',
           timestamp: new Date(tx.block_timestamp).getTime(),
           blockNumber: Number(tx.block_number || 0)
         });
@@ -664,13 +669,9 @@ async function getChainTokenTransfers(address, chain) {
     transactions.sort((a, b) => b.timestamp - a.timestamp);
     return transactions;
   } catch (error) {
-    console.error(`❌ ${chain.toUpperCase()} transfer fetch error:`, error.message);
+    console.error(`❌ BEP20 transfer fetch error:`, error.message);
     return [];
   }
-}
-
-async function getBEP20Transactions(address) {
-  return getChainTokenTransfers(address, 'bsc');
 }
 
 // 📌 ИСПРАВЛЕННЫЙ БЛОК ДЛЯ ERC20: Работает автономно и безопасно
