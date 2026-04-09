@@ -1,6 +1,7 @@
 // server.js — Oracle Deposit System (BEP20 + ERC20 + TRC20 USDT/USDC)
 // Built from the user's original full server flow.
 // Changes vs original:
+// - UNIFIED EVM WALLETS: One 0x... address generated and shared across USDT/USDC and BEP20/ERC20.
 // - TRC20 restored for USDT
 // - ERC20 explicitly fixed (contract_addresses, limit 100, strict 6 decimals)
 // - BEP20 explicitly fixed (contract_addresses, limit 100, strict 18 decimals)
@@ -110,41 +111,11 @@ if (!TRONGRID_API_KEY) {
 }
 
 const networkFields = {
-  usdt_bep20: {
-    addressField: 'usdt_bep20_address',
-    privateKeyField: 'usdt_bep20_private_key',
-    contractAddress: USDT_BSC_CONTRACT,
-    token: 'USDT',
-    chain: 'bsc'
-  },
-  usdc_bep20: {
-    addressField: 'usdc_bep20_address',
-    privateKeyField: 'usdc_bep20_private_key',
-    contractAddress: USDC_BSC_CONTRACT,
-    token: 'USDC',
-    chain: 'bsc'
-  },
-  usdt_erc20: {
-    addressField: 'usdt_erc20_address',
-    privateKeyField: 'usdt_erc20_private_key',
-    contractAddress: USDT_ETH_CONTRACT,
-    token: 'USDT',
-    chain: 'eth'
-  },
-  usdc_erc20: {
-    addressField: 'usdc_erc20_address',
-    privateKeyField: 'usdc_erc20_private_key',
-    contractAddress: USDC_ETH_CONTRACT,
-    token: 'USDC',
-    chain: 'eth'
-  },
-  usdt_trc20: {
-    addressField: 'usdt_trc20_address',
-    privateKeyField: 'usdt_trc20_private_key',
-    contractAddress: USDT_TRON_CONTRACT,
-    token: 'USDT',
-    chain: 'tron'
-  }
+  usdt_bep20: { addressField: 'usdt_bep20_address' },
+  usdc_bep20: { addressField: 'usdc_bep20_address' },
+  usdt_erc20: { addressField: 'usdt_erc20_address' },
+  usdc_erc20: { addressField: 'usdc_erc20_address' },
+  usdt_trc20: { addressField: 'usdt_trc20_address' }
 };
 
 const allowedNetworks = Object.keys(networkFields);
@@ -349,9 +320,6 @@ async function generateWallet(user_id, network) {
       throw new Error('Unsupported network');
     }
 
-    const { addressField } = fields;
-
-    // Check existing wallet row
     const { data: existingWallet, error: walletError } = await supabase
       .from('user_wallets')
       .select('*')
@@ -363,101 +331,125 @@ async function generateWallet(user_id, network) {
       throw walletError;
     }
 
-    if (existingWallet && existingWallet[addressField]) {
-      console.log(`✅ Wallet already exists: ${existingWallet[addressField]}`);
+    const isEVM = network.includes('bep20') || network.includes('erc20');
 
-      return {
-        success: true,
-        address: existingWallet[addressField],
-        exists: true,
-        network
-      };
-    }
-
-    const wallet = network.endsWith('_trc20') ? generateTRONWallet() : await generateEVMWallet();
-    const address = wallet.address;
-    const privateKey = wallet.privateKey;
-    const encryptedPrivateKey = encryptPrivateKey(privateKey);
-
-    console.log(`✅ Generated ${network} wallet: ${address}`);
-
-    const walletData = {
-      [addressField]: address,
-      updated_at: new Date().toISOString()
-    };
-
-    if (existingWallet) {
-      const { error } = await supabase
-        .from('user_wallets')
-        .update(walletData)
-        .eq('user_id', user_id);
-
-      if (error) {
-        console.error('❌ Database update error:', error.message);
-        throw new Error('Failed to update wallet');
-      }
-    } else {
-      const insertPayload = {
-        user_id,
-        default_network: network,
-        created_at: new Date().toISOString(),
-        ...walletData
-      };
-
-      const { error } = await supabase.from('user_wallets').insert(insertPayload);
-      if (error) {
-        console.error('❌ Database insert error:', error.message);
-        throw new Error('Failed to save wallet');
-      }
-    }
-
-    const { error: pkError } = await supabase
-      .from('private_keys')
-      .upsert(
-        {
-          user_id,
-          network,
-          address,
-          encrypted_private_key: encryptedPrivateKey,
-          updated_at: new Date().toISOString()
-        },
-        { onConflict: 'user_id,network' }
+    if (isEVM) {
+      const existingEVM = existingWallet && (
+        existingWallet.usdt_bep20_address ||
+        existingWallet.usdc_bep20_address ||
+        existingWallet.usdt_erc20_address ||
+        existingWallet.usdc_erc20_address
       );
 
-    if (pkError) {
-      console.error('❌ Error saving encrypted private key:', pkError.message);
-      throw new Error('Failed to save private key');
-    }
-
-    await safeSystemLog('deposit_wallet_generated', `Wallet generated for user ${user_id}`, {
-      user_id,
-      network,
-      address
-    });
-
-    // Trigger user-specific quick re-check after generation
-    setTimeout(() => {
-      if (network.endsWith('_bep20')) {
-        checkUserBEP20Deposits(user_id).catch((err) => {
-          console.error('❌ Deferred BEP20 check error:', err.message);
-        });
-      } else if (network.endsWith('_erc20')) {
-        checkUserERC20Deposits(user_id).catch((err) => {
-          console.error('❌ Deferred ERC20 check error:', err.message);
-        });
-      } else if (network.endsWith('_trc20')) {
-        checkUserTRC20Deposits(user_id).catch((err) => {
-          console.error('❌ Deferred TRC20 check error:', err.message);
-        });
+      if (existingEVM) {
+        console.log(`✅ Unified EVM Wallet already exists: ${existingEVM}`);
+        
+        // Синхронизируем базу, если другие EVM поля пустые
+        if (existingWallet && (
+          existingWallet.usdt_bep20_address !== existingEVM ||
+          existingWallet.usdc_bep20_address !== existingEVM ||
+          existingWallet.usdt_erc20_address !== existingEVM ||
+          existingWallet.usdc_erc20_address !== existingEVM
+        )) {
+          await supabase.from('user_wallets').update({
+            usdt_bep20_address: existingEVM,
+            usdc_bep20_address: existingEVM,
+            usdt_erc20_address: existingEVM,
+            usdc_erc20_address: existingEVM,
+            updated_at: new Date().toISOString()
+          }).eq('user_id', user_id);
+        }
+        return { success: true, address: existingEVM, exists: true, network };
       }
-    }, 10000);
 
-    return {
-      success: true,
-      address,
-      exists: false,
-      network
-    };
+      // Если нет EVM кошелька, создаем НОВЫЙ ЕДИНЫЙ кошелек
+      const wallet = await generateEVMWallet();
+      const address = wallet.address;
+      const privateKey = wallet.privateKey;
+      const encryptedPrivateKey = encryptPrivateKey(privateKey);
+
+      console.log(`✅ Generated NEW Unified EVM wallet: ${address}`);
+
+      const walletData = {
+        usdt_bep20_address: address,
+        usdc_bep20_address: address,
+        usdt_erc20_address: address,
+        usdc_erc20_address: address,
+        updated_at: new Date().toISOString()
+      };
+
+      if (existingWallet) {
+        const { error } = await supabase.from('user_wallets').update(walletData).eq('user_id', user_id);
+        if (error) throw new Error('Failed to update wallet');
+      } else {
+        const { error } = await supabase.from('user_wallets').insert({
+          user_id,
+          default_network: network,
+          created_at: new Date().toISOString(),
+          ...walletData
+        });
+        if (error) throw new Error('Failed to save wallet');
+      }
+
+      // Сохраняем приватный ключ сразу для всех 4-х сетей
+      const evmNetworks = ['usdt_bep20', 'usdc_bep20', 'usdt_erc20', 'usdc_erc20'];
+      const pkUpserts = evmNetworks.map(net => ({
+        user_id,
+        network: net,
+        address,
+        encrypted_private_key: encryptedPrivateKey,
+        updated_at: new Date().toISOString()
+      }));
+
+      const { error: pkError } = await supabase.from('private_keys').upsert(pkUpserts, { onConflict: 'user_id,network' });
+      if (pkError) throw new Error('Failed to save private keys');
+
+      await safeSystemLog('deposit_wallet_generated', `Unified EVM Wallet generated for user ${user_id}`, { user_id, network, address });
+      
+      setTimeout(() => {
+        if (network.includes('bep20')) checkUserBEP20Deposits(user_id).catch(e => console.error(e));
+        if (network.includes('erc20')) checkUserERC20Deposits(user_id).catch(e => console.error(e));
+      }, 10000);
+
+      return { success: true, address, exists: false, network };
+    } 
+    else {
+      // ЛОГИКА ДЛЯ TRC20 КОШЕЛЬКА (TRON)
+      if (existingWallet && existingWallet.usdt_trc20_address) {
+        console.log(`✅ TRON Wallet already exists: ${existingWallet.usdt_trc20_address}`);
+        return { success: true, address: existingWallet.usdt_trc20_address, exists: true, network };
+      }
+
+      const wallet = generateTRONWallet();
+      const address = wallet.address;
+      const privateKey = wallet.privateKey;
+      const encryptedPrivateKey = encryptPrivateKey(privateKey);
+
+      console.log(`✅ Generated NEW TRON wallet: ${address}`);
+
+      const walletData = { usdt_trc20_address: address, updated_at: new Date().toISOString() };
+
+      if (existingWallet) {
+        const { error } = await supabase.from('user_wallets').update(walletData).eq('user_id', user_id);
+        if (error) throw new Error('Failed to update TRON wallet');
+      } else {
+        const { error } = await supabase.from('user_wallets').insert({
+          user_id, default_network: network, created_at: new Date().toISOString(), ...walletData
+        });
+        if (error) throw new Error('Failed to save TRON wallet');
+      }
+
+      const { error: pkError } = await supabase.from('private_keys').upsert({
+        user_id, network: 'usdt_trc20', address, encrypted_private_key: encryptedPrivateKey, updated_at: new Date().toISOString()
+      }, { onConflict: 'user_id,network' });
+      if (pkError) throw new Error('Failed to save TRON private key');
+
+      await safeSystemLog('deposit_wallet_generated', `TRON Wallet generated for user ${user_id}`, { user_id, network, address });
+      
+      setTimeout(() => checkUserTRC20Deposits(user_id).catch(e => console.error(e)), 10000);
+
+      return { success: true, address, exists: false, network };
+    }
   } catch (error) {
     console.error('❌ Generate wallet error:', error.message);
     throw error;
@@ -603,7 +595,6 @@ async function processDepositAtomic(userId, amount, txid, network) {
 
 // ========== CHAIN TRANSFERS ==========
 
-// 📌 ИСПРАВЛЕННЫЙ БЛОК ДЛЯ BEP20: Работает автономно и безопасно
 async function getBEP20Transactions(address) {
   try {
     if (!address) return [];
@@ -674,7 +665,6 @@ async function getBEP20Transactions(address) {
   }
 }
 
-// 📌 ИСПРАВЛЕННЫЙ БЛОК ДЛЯ ERC20: Работает автономно и безопасно
 async function getERC20Transactions(address) {
   try {
     if (!address) return [];
