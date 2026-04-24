@@ -1209,10 +1209,11 @@ app.post('/public/deposit/generate', async (req, res) => {
       return res.status(400).json({ success: false, error: 'Unsupported network' });
     }
 
+    // ИСПРАВЛЕНИЕ ЗДЕСЬ: ищем по колонке 'id', а не 'user_id'
     const { data: user, error: userError } = await supabase
       .from('profiles')
-      .select('user_id')
-      .eq('user_id', user_id)
+      .select('id')
+      .eq('id', user_id)
       .maybeSingle();
 
     if (userError) {
