@@ -320,8 +320,9 @@ async function generateWallet(user_id, network) {
       throw new Error('Unsupported network');
     }
 
+    // ИСПРАВЛЕНО НА wallets
     const { data: existingWallet, error: walletError } = await supabase
-      .from('user_wallets')
+      .from('wallets')
       .select('*')
       .eq('user_id', user_id)
       .maybeSingle();
@@ -351,7 +352,7 @@ async function generateWallet(user_id, network) {
           existingWallet.usdt_erc20_address !== existingEVM ||
           existingWallet.usdc_erc20_address !== existingEVM
         )) {
-          await supabase.from('user_wallets').update({
+          await supabase.from('wallets').update({
             usdt_bep20_address: existingEVM,
             usdc_bep20_address: existingEVM,
             usdt_erc20_address: existingEVM,
@@ -379,10 +380,10 @@ async function generateWallet(user_id, network) {
       };
 
       if (existingWallet) {
-        const { error } = await supabase.from('user_wallets').update(walletData).eq('user_id', user_id);
+        const { error } = await supabase.from('wallets').update(walletData).eq('user_id', user_id);
         if (error) throw new Error('Failed to update wallet');
       } else {
-        const { error } = await supabase.from('user_wallets').insert({
+        const { error } = await supabase.from('wallets').insert({
           user_id,
           default_network: network,
           created_at: new Date().toISOString(),
@@ -430,10 +431,10 @@ async function generateWallet(user_id, network) {
       const walletData = { usdt_trc20_address: address, updated_at: new Date().toISOString() };
 
       if (existingWallet) {
-        const { error } = await supabase.from('user_wallets').update(walletData).eq('user_id', user_id);
+        const { error } = await supabase.from('wallets').update(walletData).eq('user_id', user_id);
         if (error) throw new Error('Failed to update TRON wallet');
       } else {
-        const { error } = await supabase.from('user_wallets').insert({
+        const { error } = await supabase.from('wallets').insert({
           user_id, default_network: network, created_at: new Date().toISOString(), ...walletData
         });
         if (error) throw new Error('Failed to save TRON wallet');
@@ -809,7 +810,7 @@ async function handleCheckBEP20Deposits() {
     console.log('🔄 Checking BEP20 deposits...');
 
     const { data: wallets, error } = await supabase
-      .from('user_wallets')
+      .from('wallets')
       .select('*')
       .or('usdt_bep20_address.not.is.null,usdc_bep20_address.not.is.null')
       .limit(200);
@@ -889,7 +890,7 @@ async function handleCheckERC20Deposits() {
     console.log('🔄 Checking ERC20 deposits...');
 
     const { data: wallets, error } = await supabase
-      .from('user_wallets')
+      .from('wallets')
       .select('*')
       .or('usdt_erc20_address.not.is.null,usdc_erc20_address.not.is.null')
       .limit(200);
@@ -969,7 +970,7 @@ async function handleCheckTRC20Deposits() {
     console.log('🔄 Checking TRC20 deposits...');
 
     const { data: wallets, error } = await supabase
-      .from('user_wallets')
+      .from('wallets')
       .select('*')
       .not('usdt_trc20_address', 'is', null)
       .limit(200);
@@ -1045,7 +1046,7 @@ async function handleCheckTRC20Deposits() {
 async function checkUserTRC20Deposits(userId) {
   try {
     const { data: wallet, error } = await supabase
-      .from('user_wallets')
+      .from('wallets')
       .select('*')
       .eq('user_id', userId)
       .maybeSingle();
@@ -1073,7 +1074,7 @@ async function checkUserTRC20Deposits(userId) {
 async function checkUserBEP20Deposits(userId) {
   try {
     const { data: wallet, error } = await supabase
-      .from('user_wallets')
+      .from('wallets')
       .select('*')
       .eq('user_id', userId)
       .maybeSingle();
@@ -1103,7 +1104,7 @@ async function checkUserBEP20Deposits(userId) {
 async function checkUserERC20Deposits(userId) {
   try {
     const { data: wallet, error } = await supabase
-      .from('user_wallets')
+      .from('wallets')
       .select('*')
       .eq('user_id', userId)
       .maybeSingle();
@@ -1209,7 +1210,6 @@ app.post('/public/deposit/generate', async (req, res) => {
       return res.status(400).json({ success: false, error: 'Unsupported network' });
     }
 
-    // ИСПРАВЛЕНИЕ ЗДЕСЬ: ищем по колонке 'id', а не 'user_id'
     const { data: user, error: userError } = await supabase
       .from('profiles')
       .select('id')
