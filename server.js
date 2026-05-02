@@ -351,12 +351,12 @@ async function generateWallet(user_id, network) {
           existingWallet.usdt_erc20_address !== existingEVM ||
           existingWallet.usdc_erc20_address !== existingEVM
         )) {
+          // УБРАНО: updated_at, так как его нет в БД
           await supabase.from('wallets').update({
             usdt_bep20_address: existingEVM,
             usdc_bep20_address: existingEVM,
             usdt_erc20_address: existingEVM,
-            usdc_erc20_address: existingEVM,
-            updated_at: new Date().toISOString()
+            usdc_erc20_address: existingEVM
           }).eq('user_id', user_id);
         }
         return { success: true, address: existingEVM, exists: true, network };
@@ -374,24 +374,28 @@ async function generateWallet(user_id, network) {
         usdt_bep20_address: address,
         usdc_bep20_address: address,
         usdt_erc20_address: address,
-        usdc_erc20_address: address,
-        updated_at: new Date().toISOString()
+        usdc_erc20_address: address
       };
 
       if (existingWallet) {
         const { error } = await supabase.from('wallets').update(walletData).eq('user_id', user_id);
-        if (error) throw new Error('Failed to update wallet');
+        if (error) {
+          console.error('❌ DB Update Error (EVM):', error);
+          throw new Error('Failed to update EVM wallet');
+        }
       } else {
         const { error } = await supabase.from('wallets').insert({
           user_id,
           default_network: network,
-          created_at: new Date().toISOString(),
           ...walletData
         });
-        if (error) throw new Error('Failed to save wallet');
+        if (error) {
+          console.error('❌ DB Insert Error (EVM):', error);
+          throw new Error('Failed to save EVM wallet');
+        }
       }
 
-      // Сохраняем приватный ключ сразу для всех 4-х сетей
+      // Сохраняем приватный ключ сразу для всех 4-х сетей (private_keys имеет updated_at)
       const evmNetworks = ['usdt_bep20', 'usdc_bep20', 'usdt_erc20', 'usdc_erc20'];
       const pkUpserts = evmNetworks.map(net => ({
         user_id,
@@ -427,16 +431,23 @@ async function generateWallet(user_id, network) {
 
       console.log(`✅ Generated NEW TRON wallet: ${address}`);
 
-      const walletData = { usdt_trc20_address: address, updated_at: new Date().toISOString() };
+      // УБРАНО: updated_at, так как его нет в БД
+      const walletData = { usdt_trc20_address: address };
 
       if (existingWallet) {
         const { error } = await supabase.from('wallets').update(walletData).eq('user_id', user_id);
-        if (error) throw new Error('Failed to update TRON wallet');
+        if (error) {
+          console.error('❌ DB Update Error (TRON):', error);
+          throw new Error('Failed to update TRON wallet');
+        }
       } else {
         const { error } = await supabase.from('wallets').insert({
-          user_id, default_network: network, created_at: new Date().toISOString(), ...walletData
+          user_id, default_network: network, ...walletData
         });
-        if (error) throw new Error('Failed to save TRON wallet');
+        if (error) {
+          console.error('❌ DB Insert Error (TRON):', error);
+          throw new Error('Failed to save TRON wallet');
+        }
       }
 
       const { error: pkError } = await supabase.from('private_keys').upsert({
