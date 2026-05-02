@@ -320,7 +320,6 @@ async function generateWallet(user_id, network) {
       throw new Error('Unsupported network');
     }
 
-    // ИСПРАВЛЕНО НА wallets
     const { data: existingWallet, error: walletError } = await supabase
       .from('wallets')
       .select('*')
@@ -1204,26 +1203,11 @@ app.post('/public/deposit/generate', async (req, res) => {
       return res.status(401).json({ success: false, error: 'Auth required' });
     }
 
+    // ИСПРАВЛЕНИЕ: Берем ID напрямую из проверенного токена
     const user_id = bearerUser.id;
 
     if (!allowedNetworks.includes(network)) {
       return res.status(400).json({ success: false, error: 'Unsupported network' });
-    }
-
-    const { data: user, error: userError } = await supabase
-      .from('profiles')
-      .select('id')
-      .eq('id', user_id)
-      .maybeSingle();
-
-    if (userError) {
-      console.error('❌ [PUBLIC] User lookup error:', userError.message);
-      return res.status(500).json({ success: false, error: 'User lookup failed' });
-    }
-
-    if (!user) {
-      console.log('❌ [PUBLIC] User not found:', user_id);
-      return res.status(404).json({ success: false, error: 'User not found' });
     }
 
     const result = await generateWallet(user_id, network);
