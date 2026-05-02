@@ -321,7 +321,7 @@ async function generateWallet(user_id, network) {
     }
 
     const { data: existingWallet, error: walletError } = await supabase
-      .from('wallets')
+      .from('user_wallets')
       .select('*')
       .eq('user_id', user_id)
       .maybeSingle();
@@ -351,12 +351,12 @@ async function generateWallet(user_id, network) {
           existingWallet.usdt_erc20_address !== existingEVM ||
           existingWallet.usdc_erc20_address !== existingEVM
         )) {
-          // УБРАНО: updated_at, так как его нет в БД
-          await supabase.from('wallets').update({
+          await supabase.from('user_wallets').update({
             usdt_bep20_address: existingEVM,
             usdc_bep20_address: existingEVM,
             usdt_erc20_address: existingEVM,
-            usdc_erc20_address: existingEVM
+            usdc_erc20_address: existingEVM,
+            updated_at: new Date().toISOString()
           }).eq('user_id', user_id);
         }
         return { success: true, address: existingEVM, exists: true, network };
@@ -374,28 +374,24 @@ async function generateWallet(user_id, network) {
         usdt_bep20_address: address,
         usdc_bep20_address: address,
         usdt_erc20_address: address,
-        usdc_erc20_address: address
+        usdc_erc20_address: address,
+        updated_at: new Date().toISOString()
       };
 
       if (existingWallet) {
-        const { error } = await supabase.from('wallets').update(walletData).eq('user_id', user_id);
-        if (error) {
-          console.error('❌ DB Update Error (EVM):', error);
-          throw new Error('Failed to update EVM wallet');
-        }
+        const { error } = await supabase.from('user_wallets').update(walletData).eq('user_id', user_id);
+        if (error) throw new Error('Failed to update wallet');
       } else {
-        const { error } = await supabase.from('wallets').insert({
+        const { error } = await supabase.from('user_wallets').insert({
           user_id,
           default_network: network,
+          created_at: new Date().toISOString(),
           ...walletData
         });
-        if (error) {
-          console.error('❌ DB Insert Error (EVM):', error);
-          throw new Error('Failed to save EVM wallet');
-        }
+        if (error) throw new Error('Failed to save wallet');
       }
 
-      // Сохраняем приватный ключ сразу для всех 4-х сетей (private_keys имеет updated_at)
+      // Сохраняем приватный ключ сразу для всех 4-х сетей
       const evmNetworks = ['usdt_bep20', 'usdc_bep20', 'usdt_erc20', 'usdc_erc20'];
       const pkUpserts = evmNetworks.map(net => ({
         user_id,
@@ -431,23 +427,16 @@ async function generateWallet(user_id, network) {
 
       console.log(`✅ Generated NEW TRON wallet: ${address}`);
 
-      // УБРАНО: updated_at, так как его нет в БД
-      const walletData = { usdt_trc20_address: address };
+      const walletData = { usdt_trc20_address: address, updated_at: new Date().toISOString() };
 
       if (existingWallet) {
-        const { error } = await supabase.from('wallets').update(walletData).eq('user_id', user_id);
-        if (error) {
-          console.error('❌ DB Update Error (TRON):', error);
-          throw new Error('Failed to update TRON wallet');
-        }
+        const { error } = await supabase.from('user_wallets').update(walletData).eq('user_id', user_id);
+        if (error) throw new Error('Failed to update TRON wallet');
       } else {
-        const { error } = await supabase.from('wallets').insert({
-          user_id, default_network: network, ...walletData
+        const { error } = await supabase.from('user_wallets').insert({
+          user_id, default_network: network, created_at: new Date().toISOString(), ...walletData
         });
-        if (error) {
-          console.error('❌ DB Insert Error (TRON):', error);
-          throw new Error('Failed to save TRON wallet');
-        }
+        if (error) throw new Error('Failed to save TRON wallet');
       }
 
       const { error: pkError } = await supabase.from('private_keys').upsert({
@@ -820,7 +809,7 @@ async function handleCheckBEP20Deposits() {
     console.log('🔄 Checking BEP20 deposits...');
 
     const { data: wallets, error } = await supabase
-      .from('wallets')
+      .from('user_wallets')
       .select('*')
       .or('usdt_bep20_address.not.is.null,usdc_bep20_address.not.is.null')
       .limit(200);
@@ -900,7 +889,7 @@ async function handleCheckERC20Deposits() {
     console.log('🔄 Checking ERC20 deposits...');
 
     const { data: wallets, error } = await supabase
-      .from('wallets')
+      .from('user_wallets')
       .select('*')
       .or('usdt_erc20_address.not.is.null,usdc_erc20_address.not.is.null')
       .limit(200);
@@ -980,7 +969,7 @@ async function handleCheckTRC20Deposits() {
     console.log('🔄 Checking TRC20 deposits...');
 
     const { data: wallets, error } = await supabase
-      .from('wallets')
+      .from('user_wallets')
       .select('*')
       .not('usdt_trc20_address', 'is', null)
       .limit(200);
@@ -1056,7 +1045,7 @@ async function handleCheckTRC20Deposits() {
 async function checkUserTRC20Deposits(userId) {
   try {
     const { data: wallet, error } = await supabase
-      .from('wallets')
+      .from('user_wallets')
       .select('*')
       .eq('user_id', userId)
       .maybeSingle();
@@ -1084,7 +1073,7 @@ async function checkUserTRC20Deposits(userId) {
 async function checkUserBEP20Deposits(userId) {
   try {
     const { data: wallet, error } = await supabase
-      .from('wallets')
+      .from('user_wallets')
       .select('*')
       .eq('user_id', userId)
       .maybeSingle();
@@ -1114,7 +1103,7 @@ async function checkUserBEP20Deposits(userId) {
 async function checkUserERC20Deposits(userId) {
   try {
     const { data: wallet, error } = await supabase
-      .from('wallets')
+      .from('user_wallets')
       .select('*')
       .eq('user_id', userId)
       .maybeSingle();
@@ -1214,11 +1203,27 @@ app.post('/public/deposit/generate', async (req, res) => {
       return res.status(401).json({ success: false, error: 'Auth required' });
     }
 
-    // ИСПРАВЛЕНИЕ: Берем ID напрямую из проверенного токена
     const user_id = bearerUser.id;
 
     if (!allowedNetworks.includes(network)) {
       return res.status(400).json({ success: false, error: 'Unsupported network' });
+    }
+
+    // ИСПРАВЛЕНИЕ ЗДЕСЬ: ищем по колонке 'id', а не 'user_id'
+    const { data: user, error: userError } = await supabase
+      .from('profiles')
+      .select('id')
+      .eq('id', user_id)
+      .maybeSingle();
+
+    if (userError) {
+      console.error('❌ [PUBLIC] User lookup error:', userError.message);
+      return res.status(500).json({ success: false, error: 'User lookup failed' });
+    }
+
+    if (!user) {
+      console.log('❌ [PUBLIC] User not found:', user_id);
+      return res.status(404).json({ success: false, error: 'User not found' });
     }
 
     const result = await generateWallet(user_id, network);
