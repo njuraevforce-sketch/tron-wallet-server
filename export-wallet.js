@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 const { createClient } = require('@supabase/supabase-js');
 const crypto = require('crypto');
+const WebSocket = require('ws'); // ИСПРАВЛЕНИЕ: Добавлен пакет ws
 
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://fkjwueogfmdolcjtvvme.supabase.co';
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
@@ -119,11 +120,15 @@ async function main() {
     fail(`Unsupported network: ${network}`);
   }
 
+  // ИСПРАВЛЕНИЕ: Добавлен транспорт realtime
   const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
     auth: {
       autoRefreshToken: false,
       persistSession: false,
     },
+    realtime: {
+      transport: WebSocket
+    }
   });
 
   const { data, error } = await supabase
