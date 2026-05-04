@@ -106,7 +106,7 @@ function simpleRateLimit(req, res, next) {
 app.use(simpleRateLimit);
 
 // ========== CONSTANTS ==========
-const MIN_DEPOSIT = 0;
+const MIN_DEPOSIT = 17;
 
 // BSC
 const USDT_BSC_CONTRACT = '0x55d398326f99059fF775485246999027B3197955';
