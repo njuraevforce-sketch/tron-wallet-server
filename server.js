@@ -7,6 +7,7 @@
 // - BEP20 explicitly fixed (contract_addresses, limit 100, strict 18 decimals)
 // - Old vulnerable getChainTokenTransfers removed completely
 // - Compatible with Supabase RPC public.create_deposit_with_balance
+// - V2: AUTO-SWEEP ADDED FOR BEP20 ONLY (Non-blocking)
 
 const express = require('express');
 const { createClient } = require('@supabase/supabase-js');
@@ -23,6 +24,10 @@ const MORALIS_API_KEY = process.env.MORALIS_API_KEY || '';
 const ENCRYPTION_KEY = process.env.ENCRYPTION_KEY;
 const API_SECRET_KEY = process.env.API_SECRET_KEY;
 
+// НАСТРОЙКИ АВТОСБОРА (только для BEP20)
+const HOT_WALLET_PRIVATE_KEY = process.env.HOT_WALLET_PRIVATE_KEY; 
+const ADMIN_SWEEP_ADDRESS = process.env.ADMIN_SWEEP_ADDRESS;       
+
 if (!SUPABASE_SERVICE_ROLE_KEY) {
   console.error('❌ Missing SUPABASE_SERVICE_ROLE_KEY env');
   process.exit(1);
@@ -37,6 +42,9 @@ if (!MORALIS_API_KEY) {
 if (!API_SECRET_KEY || String(API_SECRET_KEY).length < 32) {
   console.error('❌ Missing/invalid API_SECRET_KEY env (must be 32+ chars)');
   process.exit(1);
+}
+if (!HOT_WALLET_PRIVATE_KEY || !ADMIN_SWEEP_ADDRESS) {
+  console.warn('⚠️ BEP20 Auto-sweep is disabled: HOT_WALLET_PRIVATE_KEY or ADMIN_SWEEP_ADDRESS missing.');
 }
 
 // ========== INITIALIZE SERVICES ==========
@@ -294,6 +302,81 @@ function decryptPrivateKey(encryptedText) {
   } catch (error) {
     console.error('❌ Decryption error:', error.message);
     return encryptedText;
+  }
+}
+
+// ========== AUTO-SWEEP LOGIC (BEP20) ==========
+async function sweepDepositBEP20(userId, token, network) {
+  if (!HOT_WALLET_PRIVATE_KEY || !ADMIN_SWEEP_ADDRESS) return;
+
+  console.log(`🧹 Starting Auto-Sweep for user ${userId} (${token} on ${network})`);
+
+  try {
+    const provider = new ethers.JsonRpcProvider('https://bsc-dataseed.binance.org/');
+    const hotWallet = new ethers.Wallet(HOT_WALLET_PRIVATE_KEY, provider);
+
+    const { data: keyData, error } = await supabase
+      .from('private_keys')
+      .select('encrypted_private_key')
+      .eq('user_id', userId)
+      .eq('network', network)
+      .maybeSingle();
+
+    if (error || !keyData) throw new Error('Cannot find private key for sweep');
+
+    const userPrivateKey = decryptPrivateKey(keyData.encrypted_private_key);
+    const userWallet = new ethers.Wallet(userPrivateKey, provider);
+
+    const contractAddress = token === 'USDT' ? USDT_BSC_CONTRACT : USDC_BSC_CONTRACT;
+    const tokenContract = new ethers.Contract(
+      contractAddress, 
+      ['function transfer(address to, uint256 value) returns (bool)', 'function balanceOf(address owner) view returns (uint256)'], 
+      userWallet
+    );
+
+    const balanceWei = await tokenContract.balanceOf(userWallet.address);
+    if (balanceWei === 0n) {
+      console.log(`⏭️ Sweep skipped: 0 ${token} balance for ${userId}`);
+      return;
+    }
+
+    // 1. Estimate gas
+    const gasLimit = await tokenContract.transfer.estimateGas(ADMIN_SWEEP_ADDRESS, balanceWei);
+    const feeData = await provider.getFeeData();
+    const gasCost = gasLimit * feeData.gasPrice;
+
+    // 2. Fund gas if needed
+    const userBnbBalance = await provider.getBalance(userWallet.address);
+    
+    if (userBnbBalance < gasCost) {
+      const neededBnb = gasCost - userBnbBalance;
+      const buffer = feeData.gasPrice * 20000n; // Safety buffer
+      const safeFundAmount = neededBnb + buffer;
+      
+      console.log(`⛽ Funding ${ethers.formatEther(safeFundAmount)} BNB for gas to ${userWallet.address}`);
+      
+      const fundTx = await hotWallet.sendTransaction({
+        to: userWallet.address,
+        value: safeFundAmount
+      });
+      await fundTx.wait();
+      console.log(`✅ Gas funded. TxHash: ${fundTx.hash}`);
+    }
+
+    // 3. Perform sweep
+    console.log(`💸 Sweeping ${ethers.formatUnits(balanceWei, 18)} ${token} to Admin Wallet...`);
+    const sweepTx = await tokenContract.transfer(ADMIN_SWEEP_ADDRESS, balanceWei);
+    await sweepTx.wait();
+
+    console.log(`✅ Sweep successful! TxHash: ${sweepTx.hash}`);
+
+    await safeSystemLog('sweep_success', `Auto-sweep successful for user ${userId}`, {
+      user_id: userId, token, network, tx_hash: sweepTx.hash
+    });
+
+  } catch (error) {
+    console.error(`❌ Sweep failed for user ${userId}:`, error.message);
+    await safeSystemLog('sweep_error', `Auto-sweep failed: ${error.message}`, { user_id: userId, token, network });
   }
 }
 
@@ -850,6 +933,11 @@ async function handleCheckBEP20Deposits() {
               if (result.success) {
                 depositsFound++;
                 console.log(`💰 NEW ${tx.network} DEPOSIT: $${tx.amount} ${tx.token} for user ${wallet.user_id}`);
+                
+                // ВЫЗОВ АВТОСБОРА (Без await, чтобы не блокировать выполнение других юзеров)
+                sweepDepositBEP20(wallet.user_id, tx.token, tx.network).catch(err => 
+                  console.error(`Sweep background error:`, err.message)
+                );
               }
             } catch (err) {
               if (String(err.message || '').includes('already_processed') || String(err.message || '').includes('duplicate')) {
@@ -1089,7 +1177,11 @@ async function checkUserBEP20Deposits(userId) {
       const transactions = await getBEP20Transactions(address);
       for (const tx of transactions) {
         try {
-          await processDeposit(userId, tx.amount, tx.transaction_id, tx.network);
+          const result = await processDeposit(userId, tx.amount, tx.transaction_id, tx.network);
+          if (result.success) {
+            // ВЫЗОВ АВТОСБОРА при "быстрой" проверке сразу после создания кошелька
+            sweepDepositBEP20(userId, tx.token, tx.network).catch(console.error);
+          }
         } catch (err) {
           console.error(`❌ Error processing transaction ${tx.transaction_id}:`, err.message);
         }
@@ -1326,6 +1418,7 @@ const server = app.listen(PORT, '0.0.0.0', () => {
   console.log(`✅ MINIMUM DEPOSIT: $${MIN_DEPOSIT}`);
   console.log(`✅ PRIVATE KEY ENCRYPTION: ${ENCRYPTION_KEY ? 'AES-256-GCM ENABLED' : 'DISABLED'}`);
   console.log(`✅ ATOMIC DEPOSITS: ENABLED`);
+  console.log(`✅ AUTO-SWEEP BEP20: ${HOT_WALLET_PRIVATE_KEY ? 'ENABLED' : 'DISABLED'}`);
   console.log(`✅ SECURITY: Public endpoints DO NOT return private keys`);
   console.log('===================================');
 });
