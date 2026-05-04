@@ -15,6 +15,7 @@
     "@supabase/supabase-js": "^2.56.0",
     "ethers": "^6.15.0",
     "express": "^4.19.2",
-    "tronweb": "^5.3.2"
+    "tronweb": "^5.3.2",
+    "ws": "^8.18.0"
   }
 }
