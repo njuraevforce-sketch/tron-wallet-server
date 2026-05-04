@@ -55,8 +55,9 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
     autoRefreshToken: false,
     persistSession: false
   },
-  global: {
-    WebSocket: WebSocket // ИСПРАВЛЕНИЕ: Подключение ws для поддержки Realtime в Node 20
+  // ИСПРАВЛЕНО: Теперь передаем WebSocket правильно для новых версий Supabase
+  realtime: {
+    transport: WebSocket
   }
 });
 
