@@ -17,6 +17,7 @@ const crypto = require('crypto');
 const WebSocket = require('ws'); // ИСПРАВЛЕНИЕ: Добавлен пакет ws для Node.js < 22
 
 const app = express();
+app.set('trust proxy', true);
 const PORT = Number(process.env.PORT || 8080);
 
 // ========== CONFIGURATION ==========
