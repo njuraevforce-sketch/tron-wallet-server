@@ -142,7 +142,7 @@ function createCooldownMiddleware(store, cooldownMs, errorMessage) {
 
 const userDepositCheckCooldownMiddleware = createCooldownMiddleware(
   userDepositCheckCooldown,
-  Number(process.env.USER_DEPOSIT_CHECK_COOLDOWN_MS || 30000),
+  Number(process.env.USER_DEPOSIT_CHECK_COOLDOWN_MS || 60000),
   'Please wait before checking your deposit again'
 );
 
@@ -1522,7 +1522,7 @@ app.post('/public/admin/check-deposits', adminDepositCheckCooldownMiddleware, as
 
     const { data: profile, error: profileError } = await supabase
       .from('profiles')
-      .select('id, role, is_admin')
+      .select('*')
       .eq('id', bearerUser.id)
       .maybeSingle();
 
