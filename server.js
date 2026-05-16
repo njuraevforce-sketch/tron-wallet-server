@@ -106,6 +106,53 @@ function simpleRateLimit(req, res, next) {
 
 app.use(simpleRateLimit);
 
+// ========== DEPOSIT CHECK COOLDOWNS ==========
+const userDepositCheckCooldown = new Map();
+const adminDepositCheckCooldown = new Map();
+
+function cleanupCooldownStore(store, olderThanMs) {
+  const now = Date.now();
+  for (const [key, timestamp] of store.entries()) {
+    if (now - timestamp > olderThanMs) store.delete(key);
+  }
+}
+
+function createCooldownMiddleware(store, cooldownMs, errorMessage) {
+  return (req, res, next) => {
+    const authHeader = req.headers['authorization'] || '';
+    const key = authHeader || req.ip || req.connection?.remoteAddress || 'unknown';
+    const now = Date.now();
+    const last = store.get(key) || 0;
+
+    cleanupCooldownStore(store, cooldownMs * 10);
+
+    if (now - last < cooldownMs) {
+      const waitSeconds = Math.ceil((cooldownMs - (now - last)) / 1000);
+      return res.status(429).json({
+        success: false,
+        error: errorMessage,
+        wait_seconds: waitSeconds
+      });
+    }
+
+    store.set(key, now);
+    next();
+  };
+}
+
+const userDepositCheckCooldownMiddleware = createCooldownMiddleware(
+  userDepositCheckCooldown,
+  Number(process.env.USER_DEPOSIT_CHECK_COOLDOWN_MS || 30000),
+  'Please wait before checking your deposit again'
+);
+
+const adminDepositCheckCooldownMiddleware = createCooldownMiddleware(
+  adminDepositCheckCooldown,
+  Number(process.env.ADMIN_DEPOSIT_CHECK_COOLDOWN_MS || 60000),
+  'Please wait before checking all deposits again'
+);
+
+
 // ========== CONSTANTS ==========
 const MIN_DEPOSIT = 17;
 
@@ -1138,6 +1185,8 @@ async function handleCheckTRC20Deposits() {
 }
 
 async function checkUserTRC20Deposits(userId) {
+  const summary = { success: true, network_group: 'trc20', checked: 0, deposits: 0, duplicates: 0, errors: 0 };
+
   try {
     const { data: wallet, error } = await supabase
       .from('user_wallets')
@@ -1146,26 +1195,40 @@ async function checkUserTRC20Deposits(userId) {
       .maybeSingle();
 
     if (error) throw error;
-    if (!wallet) return;
+    if (!wallet) return summary;
 
     const addresses = Array.from(new Set([wallet.usdt_trc20_address].filter(Boolean)));
 
     for (const address of addresses) {
       const transactions = await getTRC20Transactions(address);
+      summary.checked += transactions.length;
+
       for (const tx of transactions) {
         try {
-          await processDeposit(userId, tx.amount, tx.transaction_id, tx.network);
+          const result = await processDeposit(userId, tx.amount, tx.transaction_id, tx.network);
+          if (result?.success) {
+            if (result.already_processed) summary.duplicates++;
+            else summary.deposits++;
+          }
         } catch (err) {
+          summary.errors++;
           console.error(`❌ Error processing transaction ${tx.transaction_id}:`, err.message);
         }
       }
     }
+
+    return summary;
   } catch (error) {
+    summary.success = false;
+    summary.error = error.message;
     console.error('❌ checkUserTRC20Deposits error:', error.message);
+    return summary;
   }
 }
 
 async function checkUserBEP20Deposits(userId) {
+  const summary = { success: true, network_group: 'bep20', checked: 0, deposits: 0, duplicates: 0, errors: 0 };
+
   try {
     const { data: wallet, error } = await supabase
       .from('user_wallets')
@@ -1174,7 +1237,7 @@ async function checkUserBEP20Deposits(userId) {
       .maybeSingle();
 
     if (error) throw error;
-    if (!wallet) return;
+    if (!wallet) return summary;
 
     const addresses = Array.from(
       new Set([wallet.usdt_bep20_address, wallet.usdc_bep20_address].filter(Boolean))
@@ -1182,24 +1245,39 @@ async function checkUserBEP20Deposits(userId) {
 
     for (const address of addresses) {
       const transactions = await getBEP20Transactions(address);
+      summary.checked += transactions.length;
+
       for (const tx of transactions) {
         try {
           const result = await processDeposit(userId, tx.amount, tx.transaction_id, tx.network);
-          if (result.success) {
-            // ВЫЗОВ АВТОСБОРА при "быстрой" проверке сразу после создания кошелька
-            sweepDepositBEP20(userId, tx.token, tx.network).catch(console.error);
+          if (result?.success) {
+            if (result.already_processed) {
+              summary.duplicates++;
+            } else {
+              summary.deposits++;
+              // ВЫЗОВ АВТОСБОРА при "быстрой" проверке сразу после создания кошелька
+              sweepDepositBEP20(userId, tx.token, tx.network).catch(console.error);
+            }
           }
         } catch (err) {
+          summary.errors++;
           console.error(`❌ Error processing transaction ${tx.transaction_id}:`, err.message);
         }
       }
     }
+
+    return summary;
   } catch (error) {
+    summary.success = false;
+    summary.error = error.message;
     console.error('❌ checkUserBEP20Deposits error:', error.message);
+    return summary;
   }
 }
 
 async function checkUserERC20Deposits(userId) {
+  const summary = { success: true, network_group: 'erc20', checked: 0, deposits: 0, duplicates: 0, errors: 0 };
+
   try {
     const { data: wallet, error } = await supabase
       .from('user_wallets')
@@ -1208,7 +1286,7 @@ async function checkUserERC20Deposits(userId) {
       .maybeSingle();
 
     if (error) throw error;
-    if (!wallet) return;
+    if (!wallet) return summary;
 
     const addresses = Array.from(
       new Set([wallet.usdt_erc20_address, wallet.usdc_erc20_address].filter(Boolean))
@@ -1216,16 +1294,28 @@ async function checkUserERC20Deposits(userId) {
 
     for (const address of addresses) {
       const transactions = await getERC20Transactions(address);
+      summary.checked += transactions.length;
+
       for (const tx of transactions) {
         try {
-          await processDeposit(userId, tx.amount, tx.transaction_id, tx.network);
+          const result = await processDeposit(userId, tx.amount, tx.transaction_id, tx.network);
+          if (result?.success) {
+            if (result.already_processed) summary.duplicates++;
+            else summary.deposits++;
+          }
         } catch (err) {
+          summary.errors++;
           console.error(`❌ Error processing transaction ${tx.transaction_id}:`, err.message);
         }
       }
     }
+
+    return summary;
   } catch (error) {
+    summary.success = false;
+    summary.error = error.message;
     console.error('❌ checkUserERC20Deposits error:', error.message);
+    return summary;
   }
 }
 
@@ -1355,6 +1445,129 @@ app.post('/public/deposit/generate', async (req, res) => {
   }
 });
 
+
+// 3. Public/app endpoint: user manually checks only their own deposit address.
+// Requires Bearer auth and resolves user only from the token.
+app.post('/public/deposit/check', userDepositCheckCooldownMiddleware, async (req, res) => {
+  try {
+    const network = readParam(req, 'network', 'usdt_bep20');
+    const bearerUser = await getUserFromBearerToken(req);
+
+    console.log('🔎 [PUBLIC] User deposit check request:', {
+      resolved_user_id: bearerUser?.id || null,
+      network,
+      ip: req.ip,
+      timestamp: new Date().toISOString(),
+      bearer_auth: !!bearerUser
+    });
+
+    if (!bearerUser?.id) {
+      return res.status(401).json({ success: false, error: 'Auth required' });
+    }
+
+    if (!allowedNetworks.includes(network)) {
+      return res.status(400).json({ success: false, error: 'Unsupported network' });
+    }
+
+    const user_id = bearerUser.id;
+    let result;
+
+    if (network.includes('bep20')) {
+      result = await checkUserBEP20Deposits(user_id);
+    } else if (network.includes('erc20')) {
+      result = await checkUserERC20Deposits(user_id);
+    } else if (network.includes('trc20')) {
+      result = await checkUserTRC20Deposits(user_id);
+    }
+
+    await safeSystemLog('public_deposit_check', `User triggered deposit check for ${user_id}`, {
+      user_id,
+      network,
+      result,
+      ip: req.ip
+    });
+
+    return res.json({
+      success: true,
+      found: Number(result?.deposits || 0) > 0,
+      network,
+      result: result || null,
+      message: Number(result?.deposits || 0) > 0
+        ? 'Deposit found and credited'
+        : 'Deposit not found yet'
+    });
+  } catch (error) {
+    console.error('❌ [PUBLIC] Deposit check error:', error.message);
+
+    await safeSystemLog('public_deposit_check_error', `Public deposit check error: ${error.message}`, {
+      error: error.message,
+      ip: req.ip,
+      body: req.body || null,
+      query: req.query || null
+    });
+
+    return res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+});
+
+// 4. Public/admin endpoint: checks all deposits after Bearer auth + role/is_admin validation.
+// This keeps API_SECRET_KEY on the server and never exposes it to frontend.
+app.post('/public/admin/check-deposits', adminDepositCheckCooldownMiddleware, async (req, res) => {
+  try {
+    const bearerUser = await getUserFromBearerToken(req);
+
+    if (!bearerUser?.id) {
+      return res.status(401).json({ success: false, error: 'Auth required' });
+    }
+
+    const { data: profile, error: profileError } = await supabase
+      .from('profiles')
+      .select('id, role, is_admin')
+      .eq('id', bearerUser.id)
+      .maybeSingle();
+
+    if (profileError) {
+      console.error('❌ [ADMIN] Profile lookup error:', profileError.message);
+      return res.status(500).json({ success: false, error: 'Profile lookup failed' });
+    }
+
+    const isAdmin = profile?.role === 'admin' || profile?.is_admin === true;
+
+    if (!isAdmin) {
+      console.warn('🚫 [ADMIN] Deposit check blocked for non-admin:', bearerUser.id);
+      return res.status(403).json({ success: false, error: 'Admin only' });
+    }
+
+    console.log('🔄 [ADMIN] Manual all-deposit check triggered:', {
+      admin_id: bearerUser.id,
+      ip: req.ip,
+      timestamp: new Date().toISOString()
+    });
+
+    const bep20Result = await handleCheckBEP20Deposits();
+    const erc20Result = await handleCheckERC20Deposits();
+    const trc20Result = await handleCheckTRC20Deposits();
+
+    await safeSystemLog('admin_deposit_check', `Admin triggered all-deposit check`, {
+      admin_id: bearerUser.id,
+      bep20: bep20Result,
+      erc20: erc20Result,
+      trc20: trc20Result,
+      ip: req.ip
+    });
+
+    return res.json({
+      success: true,
+      bep20: bep20Result,
+      erc20: erc20Result,
+      trc20: trc20Result
+    });
+  } catch (error) {
+    console.error('❌ [ADMIN] Deposit check error:', error.message);
+    return res.status(500).json({ success: false, error: 'Internal server error' });
+  }
+});
+
 app.get('/api/deposit/history', requireApiKey, async (req, res) => {
   try {
     const user_id = readParam(req, 'user_id');
@@ -1413,6 +1626,8 @@ const server = app.listen(PORT, '0.0.0.0', () => {
   console.log(`✅ Health check available at: http://0.0.0.0:${PORT}/health`);
   console.log(`✅ API Health check: http://0.0.0.0:${PORT}/api/health`);
   console.log(`✅ PUBLIC Endpoint: POST http://0.0.0.0:${PORT}/public/deposit/generate`);
+  console.log(`✅ PUBLIC Endpoint: POST http://0.0.0.0:${PORT}/public/deposit/check`);
+  console.log(`✅ ADMIN Endpoint:  POST http://0.0.0.0:${PORT}/public/admin/check-deposits`);
   console.log(`✅ SECURE Endpoint: POST http://0.0.0.0:${PORT}/api/deposit/generate (requires API key)`);
   console.log(`✅ SECURE Endpoint: GET  http://0.0.0.0:${PORT}/api/deposit/history (requires API key)`);
   console.log(`✅ SECURE Endpoint: GET  http://0.0.0.0:${PORT}/api/check-deposits (requires API key)`);
