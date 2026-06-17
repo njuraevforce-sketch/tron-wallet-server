@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 const { createClient } = require('@supabase/supabase-js');
 const { ethers } = require('ethers');
+const WebSocket = require('ws'); // Добавлен пакет ws
 
 // Настройки окружения
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://fkjwueogfmdolcjtvvme.supabase.co';
@@ -37,7 +38,16 @@ async function main() {
     process.exit(1);
   }
 
-  const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
+  // Обновленная инициализация клиента Supabase
+  const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
+    auth: {
+      autoRefreshToken: false,
+      persistSession: false
+    },
+    realtime: {
+      transport: WebSocket
+    }
+  });
   
   console.log('🔄 Загрузка кошельков из базы данных...');
   const { data: wallets, error } = await supabase.from('user_wallets').select('*');
@@ -53,7 +63,6 @@ async function main() {
 
   for (const w of wallets) {
     if (w.usdt_bep20_address) evmAddresses.add(w.usdt_bep20_address);
-    // Так как у вас unified EVM, usdc_bep20 и erc20 адреса те же самые
     if (w.usdt_trc20_address) tronAddresses.add(w.usdt_trc20_address);
   }
 
