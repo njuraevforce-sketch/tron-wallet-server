@@ -3,14 +3,29 @@ const { createClient } = require('@supabase/supabase-js');
 const { ethers } = require('ethers');
 const WebSocket = require('ws');
 
-// Настройки окружения
+// 1. Настройки БД
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://fkjwueogfmdolcjtvvme.supabase.co';
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 
-// Самые стабильные публичные RPC без лимитов на ключи
-const BSC_RPC = 'https://bsc-rpc.publicnode.com';
-const ETH_RPC = 'https://ethereum-rpc.publicnode.com'; 
+// 2. Пулы RPC серверов (Если один упадет, скрипт переключится на другой)
+const BSC_RPCS = [
+  'https://bsc-dataseed.binance.org/',
+  'https://binance.llamarpc.com',
+  'https://bsc-rpc.publicnode.com'
+];
 
+const ETH_RPCS = [
+  'https://ethereum-rpc.publicnode.com',
+  'https://rpc.ankr.com/eth',
+  'https://eth.llamarpc.com'
+];
+
+const TRON_RPCS = [
+  'https://api.trongrid.io',
+  'https://api.tronstack.io'
+];
+
+// 3. Смарт-контракты
 const USDT_BSC = '0x55d398326f99059fF775485246999027B3197955';
 const USDC_BSC = '0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d';
 const USDT_ETH = '0xdAC17F958D2ee523a2206206994597C13D831ec7';
@@ -25,6 +40,43 @@ function parseArgs() {
   return { hideEmpty: args.includes('--hide-empty') };
 }
 
+// 4. Безопасный запрос в EVM (перебирает пулы при ошибке 500/521)
+async function fetchEVMWithFallback(rpcs, chainId, address, usdtAddr, usdcAddr) {
+  let lastErr;
+  for (const rpc of rpcs) {
+    try {
+      const provider = new ethers.JsonRpcProvider(rpc, chainId, { staticNetwork: true });
+      const [coinWei, usdtWei, usdcWei] = await Promise.all([
+        provider.getBalance(address),
+        new ethers.Contract(usdtAddr, ERC20_ABI, provider).balanceOf(address),
+        new ethers.Contract(usdcAddr, ERC20_ABI, provider).balanceOf(address)
+      ]);
+      return { coinWei, usdtWei, usdcWei };
+    } catch (err) {
+      lastErr = err;
+      await sleep(200);
+    }
+  }
+  throw lastErr;
+}
+
+// 5. Безопасный запрос в TRON
+async function fetchTronWithFallback(address) {
+  let lastErr;
+  for (const rpc of TRON_RPCS) {
+    try {
+      const response = await fetch(`${rpc}/v1/accounts/${address}`);
+      if (!response.ok) throw new Error(`HTTP ${response.status}`);
+      return await response.json();
+    } catch (err) {
+      lastErr = err;
+      await sleep(200);
+    }
+  }
+  throw lastErr;
+}
+
+// ================= ОСНОВНОЙ СКРИПТ =================
 async function main() {
   const { hideEmpty } = parseArgs();
 
@@ -58,74 +110,55 @@ async function main() {
   console.log(`✅ Найдено уникальных TRON адресов: ${tronWallets.size}`);
   console.log('--------------------------------------------------');
 
-  const bscProvider = new ethers.JsonRpcProvider(BSC_RPC, 56, { staticNetwork: true });
-  const ethProvider = new ethers.JsonRpcProvider(ETH_RPC, 1, { staticNetwork: true });
-
   let totalStuck = 0;
 
+  // --- ПРОВЕРКА BSC ---
   console.log('\n🌐 ПРОВЕРКА СЕТИ BSC (BEP20)...');
   for (const [address, userId] of evmWallets.entries()) {
     try {
-      const [bnbWei, usdtWei, usdcWei] = await Promise.all([
-        bscProvider.getBalance(address),
-        new ethers.Contract(USDT_BSC, ERC20_ABI, bscProvider).balanceOf(address),
-        new ethers.Contract(USDC_BSC, ERC20_ABI, bscProvider).balanceOf(address)
-      ]);
-
-      const bnb = Number(ethers.formatEther(bnbWei));
+      const { coinWei, usdtWei, usdcWei } = await fetchEVMWithFallback(BSC_RPCS, 56, address, USDT_BSC, USDC_BSC);
+      const bnb = Number(ethers.formatEther(coinWei));
       const usdt = Number(ethers.formatUnits(usdtWei, 18));
       const usdc = Number(ethers.formatUnits(usdcWei, 18));
       const hasFunds = bnb > 0.0005 || usdt > 0.5 || usdc > 0.5;
 
       if (!hideEmpty || hasFunds) {
-        console.log(`👤 User ID: ${userId}`);
-        console.log(`📍 Адрес:   ${address}`);
-        console.log(`   BNB:     ${bnb.toFixed(4)}`);
-        console.log(`   USDT:    ${usdt.toFixed(2)}$`);
-        console.log(`   USDC:    ${usdc.toFixed(2)}$`);
-        console.log('---');
+        console.log(`👤 User ID: ${userId}\n📍 Адрес:   ${address}`);
+        console.log(`   BNB:     ${bnb.toFixed(4)}\n   USDT:    ${usdt.toFixed(2)}$\n   USDC:    ${usdc.toFixed(2)}$\n---`);
         if (usdt > 0 || usdc > 0) totalStuck += (usdt + usdc);
       }
-      await sleep(200); 
+      await sleep(100);
     } catch (err) {
       console.log(`⚠️ Ошибка BSC ${address}: ${err.message}`);
     }
   }
 
+  // --- ПРОВЕРКА ETHEREUM ---
   console.log('\n🌐 ПРОВЕРКА СЕТИ ETHEREUM (ERC20)...');
   for (const [address, userId] of evmWallets.entries()) {
     try {
-      const [ethWei, usdtWei, usdcWei] = await Promise.all([
-        ethProvider.getBalance(address),
-        new ethers.Contract(USDT_ETH, ERC20_ABI, ethProvider).balanceOf(address),
-        new ethers.Contract(USDC_ETH, ERC20_ABI, ethProvider).balanceOf(address)
-      ]);
-
-      const eth = Number(ethers.formatEther(ethWei));
+      const { coinWei, usdtWei, usdcWei } = await fetchEVMWithFallback(ETH_RPCS, 1, address, USDT_ETH, USDC_ETH);
+      const eth = Number(ethers.formatEther(coinWei));
       const usdt = Number(ethers.formatUnits(usdtWei, 6)); 
       const usdc = Number(ethers.formatUnits(usdcWei, 6));
       const hasFunds = eth > 0.0005 || usdt > 0.5 || usdc > 0.5;
 
       if (!hideEmpty || hasFunds) {
-        console.log(`👤 User ID: ${userId}`);
-        console.log(`📍 Адрес:   ${address}`);
-        console.log(`   ETH:     ${eth.toFixed(4)}`);
-        console.log(`   USDT:    ${usdt.toFixed(2)}$`);
-        console.log(`   USDC:    ${usdc.toFixed(2)}$`);
-        console.log('---');
+        console.log(`👤 User ID: ${userId}\n📍 Адрес:   ${address}`);
+        console.log(`   ETH:     ${eth.toFixed(4)}\n   USDT:    ${usdt.toFixed(2)}$\n   USDC:    ${usdc.toFixed(2)}$\n---`);
         if (usdt > 0 || usdc > 0) totalStuck += (usdt + usdc);
       }
-      await sleep(200); 
+      await sleep(100);
     } catch (err) {
       console.log(`⚠️ Ошибка ETH ${address}: ${err.message}`);
     }
   }
 
+  // --- ПРОВЕРКА TRON ---
   console.log('\n🌐 ПРОВЕРКА СЕТИ TRON (TRC20)...');
   for (const [address, userId] of tronWallets.entries()) {
     try {
-      const response = await fetch(`https://api.trongrid.io/v1/accounts/${address}`);
-      const data = await response.json();
+      const data = await fetchTronWithFallback(address);
       let trx = 0, usdt = 0;
 
       if (data.success && data.data && data.data.length > 0) {
@@ -140,14 +173,11 @@ async function main() {
 
       const hasFunds = trx > 1 || usdt > 0.5;
       if (!hideEmpty || hasFunds) {
-        console.log(`👤 User ID: ${userId}`);
-        console.log(`📍 Адрес:   ${address}`);
-        console.log(`   TRX:     ${trx.toFixed(2)}`);
-        console.log(`   USDT:    ${usdt.toFixed(2)}$`);
-        console.log('---');
+        console.log(`👤 User ID: ${userId}\n📍 Адрес:   ${address}`);
+        console.log(`   TRX:     ${trx.toFixed(2)}\n   USDT:    ${usdt.toFixed(2)}$\n---`);
         if (usdt > 0) totalStuck += usdt;
       }
-      await sleep(250); 
+      await sleep(200); 
     } catch (err) {
       console.log(`⚠️ Ошибка TRON ${address}: ${err.message}`);
     }
