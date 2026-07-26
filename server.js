@@ -6,9 +6,10 @@
 // - ERC20 explicitly fixed (contract_addresses, limit 100, strict 6 decimals)
 // - BEP20 explicitly fixed (contract_addresses, limit 100, strict 18 decimals)
 // - Old vulnerable getChainTokenTransfers removed completely
-// - Compatible with Supabase RPC public.create_deposit_with_balance
+// - Compatible with Supabase RPC public.credit_chain_deposit
 // - V2: AUTO-SWEEP ADDED FOR BEP20 ONLY (Non-blocking)
 // - V3: WEBSOCKET FIX FOR NODE.JS 20 SUPABASE COMPATIBILITY
+// - V4: MORALIS FIX - Removed URL contract filters, strictly local filtering
 
 const express = require('express');
 const { createClient } = require('@supabase/supabase-js');
@@ -21,7 +22,7 @@ app.set('trust proxy', true);
 const PORT = Number(process.env.PORT || 8080);
 
 // ========== CONFIGURATION ==========
-const SUPABASE_URL = process.env.SUPABASE_URL || 'https://fkjwueogfmdolcjtvvme.supabase.co';
+const SUPABASE_URL = process.env.SUPABASE_URL || 'https://dsfzbhrzritqxoupihxa.supabase.co';
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const MORALIS_API_KEY = process.env.MORALIS_API_KEY || '';
 const ENCRYPTION_KEY = process.env.ENCRYPTION_KEY;
@@ -56,7 +57,6 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
     autoRefreshToken: false,
     persistSession: false
   },
-  // ИСПРАВЛЕНО: Теперь передаем WebSocket правильно для новых версий Supabase
   realtime: {
     transport: WebSocket
   }
@@ -280,6 +280,38 @@ async function safeSystemLog(logType, message, metadata = {}) {
   }
 }
 
+
+// ========== DEPOSIT ADDRESS SYNC ==========
+// Keeps the existing public.deposit_addresses table in sync without changing
+// the wallet generation logic used by the blockchain scanner.
+function getDepositAsset(network) {
+  return String(network || '').toLowerCase().startsWith('usdc_') ? 'USDC' : 'USDT';
+}
+
+async function syncDepositAddress(userId, network, address) {
+  if (!userId || !network || !address) return;
+
+  const normalizedNetwork = String(network).trim().toLowerCase();
+  const asset = getDepositAsset(normalizedNetwork);
+
+  const { error } = await supabase
+    .from('deposit_addresses')
+    .upsert({
+      user_id: userId,
+      asset,
+      network: normalizedNetwork,
+      address: String(address).trim(),
+      memo: null,
+      is_active: true
+    }, {
+      onConflict: 'user_id,asset,network'
+    });
+
+  if (error) {
+    throw new Error(`Failed to sync deposit address: ${error.message}`);
+  }
+}
+
 // ========== API KEY CHECK ==========
 function requireApiKey(req, res, next) {
   const clientKey = req.headers['x-api-key'];
@@ -370,7 +402,7 @@ async function sweepDepositBEP20(userId, token, network) {
     const hotWallet = new ethers.Wallet(HOT_WALLET_PRIVATE_KEY, provider);
 
     const { data: keyData, error } = await supabase
-      .from('private_keys')
+      .from('deposit_private_keys')
       .select('encrypted_private_key')
       .eq('user_id', userId)
       .eq('network', network)
@@ -458,7 +490,7 @@ async function generateWallet(user_id, network) {
     }
 
     const { data: existingWallet, error: walletError } = await supabase
-      .from('user_wallets')
+      .from('deposit_wallets')
       .select('*')
       .eq('user_id', user_id)
       .maybeSingle();
@@ -488,7 +520,7 @@ async function generateWallet(user_id, network) {
           existingWallet.usdt_erc20_address !== existingEVM ||
           existingWallet.usdc_erc20_address !== existingEVM
         )) {
-          await supabase.from('user_wallets').update({
+          await supabase.from('deposit_wallets').update({
             usdt_bep20_address: existingEVM,
             usdc_bep20_address: existingEVM,
             usdt_erc20_address: existingEVM,
@@ -516,10 +548,10 @@ async function generateWallet(user_id, network) {
       };
 
       if (existingWallet) {
-        const { error } = await supabase.from('user_wallets').update(walletData).eq('user_id', user_id);
+        const { error } = await supabase.from('deposit_wallets').update(walletData).eq('user_id', user_id);
         if (error) throw new Error('Failed to update wallet');
       } else {
-        const { error } = await supabase.from('user_wallets').insert({
+        const { error } = await supabase.from('deposit_wallets').insert({
           user_id,
           default_network: network,
           created_at: new Date().toISOString(),
@@ -538,7 +570,7 @@ async function generateWallet(user_id, network) {
         updated_at: new Date().toISOString()
       }));
 
-      const { error: pkError } = await supabase.from('private_keys').upsert(pkUpserts, { onConflict: 'user_id,network' });
+      const { error: pkError } = await supabase.from('deposit_private_keys').upsert(pkUpserts, { onConflict: 'user_id,network' });
       if (pkError) throw new Error('Failed to save private keys');
 
       await safeSystemLog('deposit_wallet_generated', `Unified EVM Wallet generated for user ${user_id}`, { user_id, network, address });
@@ -567,16 +599,16 @@ async function generateWallet(user_id, network) {
       const walletData = { usdt_trc20_address: address, updated_at: new Date().toISOString() };
 
       if (existingWallet) {
-        const { error } = await supabase.from('user_wallets').update(walletData).eq('user_id', user_id);
+        const { error } = await supabase.from('deposit_wallets').update(walletData).eq('user_id', user_id);
         if (error) throw new Error('Failed to update TRON wallet');
       } else {
-        const { error } = await supabase.from('user_wallets').insert({
+        const { error } = await supabase.from('deposit_wallets').insert({
           user_id, default_network: network, created_at: new Date().toISOString(), ...walletData
         });
         if (error) throw new Error('Failed to save TRON wallet');
       }
 
-      const { error: pkError } = await supabase.from('private_keys').upsert({
+      const { error: pkError } = await supabase.from('deposit_private_keys').upsert({
         user_id, network: 'usdt_trc20', address, encrypted_private_key: encryptedPrivateKey, updated_at: new Date().toISOString()
       }, { onConflict: 'user_id,network' });
       if (pkError) throw new Error('Failed to save TRON private key');
@@ -594,20 +626,23 @@ async function generateWallet(user_id, network) {
 }
 
 // ========== DEPOSIT PROCESSING ==========
-async function processDeposit(userId, amount, txid, network) {
+async function processDeposit(userId, amount, txid, network, address = null, confirmations = 1) {
   try {
-    console.log(`💰 ATOMIC DEPOSIT PROCESSING: $${amount} for user ${userId}, tx: ${txid}, network: ${network}`);
+    const normalizedNetwork = String(network || '').trim().toLowerCase();
+    const normalizedTxid = String(txid || '').trim();
 
-    if (amount < MIN_DEPOSIT) {
+    console.log(`💰 ATOMIC DEPOSIT PROCESSING: $${amount} for user ${userId}, tx: ${normalizedTxid}, network: ${normalizedNetwork}`);
+
+    if (!Number.isFinite(Number(amount)) || Number(amount) < MIN_DEPOSIT) {
       console.log(`⏭️ Deposit too small: $${amount}, minimum: $${MIN_DEPOSIT}`);
       return { success: false, error: `Minimum deposit is $${MIN_DEPOSIT}` };
     }
 
     const { data: existingDeposit, error: checkError } = await supabase
-      .from('deposit_requests')
-      .select('id, status, amount, user_id')
-      .eq('tx_hash', txid)
-      .eq('network', network)
+      .from('deposits')
+      .select('id, status, amount, user_id, asset, network, tx_hash')
+      .eq('tx_hash', normalizedTxid)
+      .eq('network', normalizedNetwork)
       .maybeSingle();
 
     if (checkError) {
@@ -616,39 +651,33 @@ async function processDeposit(userId, amount, txid, network) {
     }
 
     if (existingDeposit) {
+      if (
+        existingDeposit.user_id !== userId ||
+        Number(existingDeposit.amount) !== Number(amount)
+      ) {
+        throw new Error('DEPOSIT_CONFLICT');
+      }
+
       console.log(`⏭️ Deposit already exists: #${existingDeposit.id}, status: ${existingDeposit.status}`);
-
-      if (existingDeposit.status === 'completed') {
-        return {
-          success: true,
-          already_processed: true,
-          deposit_id: existingDeposit.id,
-          message: 'Deposit already processed'
-        };
-      }
-
-      if (existingDeposit.status === 'pending') {
-        console.log(`🔄 Processing existing pending deposit #${existingDeposit.id}`);
-        const result = await processDepositAtomic(userId, amount, txid, network);
-        if (result.success) {
-          const { error: updateError } = await supabase
-            .from('deposit_requests')
-            .update({
-              status: 'completed',
-              approved_at: new Date().toISOString(),
-              approved_by: null
-            })
-            .eq('id', existingDeposit.id);
-
-          if (updateError) {
-            console.error('❌ Error updating deposit status:', updateError.message);
-          }
-        }
-        return result;
-      }
+      return {
+        success: true,
+        already_processed: true,
+        deposit_id: existingDeposit.id,
+        amount: Number(existingDeposit.amount),
+        asset: existingDeposit.asset,
+        network: existingDeposit.network,
+        message: 'Deposit already processed'
+      };
     }
 
-    return await processDepositAtomic(userId, amount, txid, network);
+    return await processDepositAtomic(
+      userId,
+      Number(amount),
+      normalizedTxid,
+      normalizedNetwork,
+      address,
+      confirmations
+    );
   } catch (error) {
     console.error('❌ Error in processDeposit:', error.message);
 
@@ -657,6 +686,8 @@ async function processDeposit(userId, amount, txid, network) {
       amount,
       tx_hash: txid,
       network,
+      address,
+      confirmations,
       error: error.message
     });
 
@@ -664,25 +695,33 @@ async function processDeposit(userId, amount, txid, network) {
   }
 }
 
-async function processDepositAtomic(userId, amount, txid, network) {
+async function processDepositAtomic(
+  userId,
+  amount,
+  txid,
+  network,
+  address = null,
+  confirmations = 1
+) {
   try {
     console.log(`🚀 Processing deposit atomically for user ${userId}, $${amount}`);
 
-    const { data: result, error } = await supabase.rpc('create_deposit_with_balance', {
+    const { data: result, error } = await supabase.rpc('credit_chain_deposit', {
       p_user_id: userId,
       p_amount: amount,
       p_network: network,
-      p_tx_hash: txid
+      p_tx_hash: txid,
+      p_address: address || null,
+      p_confirmations: Math.max(Number(confirmations || 0), 0)
     });
 
     if (error) {
       console.error('❌ Atomic deposit RPC error:', error.message);
 
-      if (String(error.message || '').includes('duplicate')) {
-        console.log(`⏭️ Duplicate detected by RPC: ${txid}`);
-
+      const message = String(error.message || '').toLowerCase();
+      if (message.includes('duplicate') || message.includes('already')) {
         const { data: existingDeposit } = await supabase
-          .from('deposit_requests')
+          .from('deposits')
           .select('*')
           .eq('tx_hash', txid)
           .eq('network', network)
@@ -692,7 +731,10 @@ async function processDepositAtomic(userId, amount, txid, network) {
           return {
             success: true,
             already_processed: true,
-            deposit_id: existingDeposit.id
+            deposit_id: existingDeposit.id,
+            amount: Number(existingDeposit.amount),
+            asset: existingDeposit.asset,
+            network: existingDeposit.network
           };
         }
       }
@@ -700,7 +742,7 @@ async function processDepositAtomic(userId, amount, txid, network) {
       throw error;
     }
 
-    if (!result || !result.success) {
+    if (!result || result.success !== true) {
       console.error('❌ Atomic deposit failed:', result?.error);
       throw new Error(result?.error || 'Deposit processing failed');
     }
@@ -713,6 +755,7 @@ async function processDepositAtomic(userId, amount, txid, network) {
       amount,
       old_balance: result.old_balance,
       new_balance: result.new_balance,
+      asset: result.asset,
       tx_hash: txid,
       network
     });
@@ -722,7 +765,9 @@ async function processDepositAtomic(userId, amount, txid, network) {
       deposit_id: result.deposit_id,
       old_balance: result.old_balance,
       new_balance: result.new_balance,
-      amount
+      amount: result.amount,
+      asset: result.asset,
+      network: result.network
     };
   } catch (error) {
     console.error('❌ Atomic deposit error:', error.message);
@@ -740,8 +785,7 @@ async function getBEP20Transactions(address) {
       chain: 'bsc',
       limit: '100'
     });
-    params.append('contract_addresses', USDT_BSC_CONTRACT);
-    params.append('contract_addresses', USDC_BSC_CONTRACT);
+    // ⚠️ ИСПРАВЛЕНИЕ: Фильтры contract_addresses убраны из URL, чтобы не ломать Moralis
 
     const url = `https://deep-index.moralis.io/api/v2/${address}/erc20/transfers?${params.toString()}`;
 
@@ -768,11 +812,11 @@ async function getBEP20Transactions(address) {
 
         const tokenContract = String(tx.address || '').toLowerCase();
         
+        // ⚠️ ИСПРАВЛЕНИЕ: Локальная фильтрация USDT/USDC контрактов
         if (!validContracts.includes(tokenContract)) continue;
 
         const isUSDT = tokenContract === USDT_BSC_CONTRACT.toLowerCase();
         
-        // BSC использует 18 нулей
         const decimals = Number(tx.decimals || 18);
         const amount = Number(tx.value) / Math.pow(10, decimals);
         
@@ -810,8 +854,7 @@ async function getERC20Transactions(address) {
       chain: 'eth',
       limit: '100'
     });
-    params.append('contract_addresses', USDT_ETH_CONTRACT);
-    params.append('contract_addresses', USDC_ETH_CONTRACT);
+    // ⚠️ ИСПРАВЛЕНИЕ: Фильтры contract_addresses убраны из URL, чтобы не ломать Moralis
 
     const url = `https://deep-index.moralis.io/api/v2/${address}/erc20/transfers?${params.toString()}`;
 
@@ -838,6 +881,7 @@ async function getERC20Transactions(address) {
 
         const tokenContract = String(tx.address || '').toLowerCase();
         
+        // ⚠️ ИСПРАВЛЕНИЕ: Локальная фильтрация USDT/USDC контрактов
         if (!validContracts.includes(tokenContract)) continue;
 
         const isUSDT = tokenContract === USDT_ETH_CONTRACT.toLowerCase();
@@ -946,7 +990,7 @@ async function handleCheckBEP20Deposits() {
     console.log('🔄 Checking BEP20 deposits...');
 
     const { data: wallets, error } = await supabase
-      .from('user_wallets')
+      .from('deposit_wallets')
       .select('*')
       .or('usdt_bep20_address.not.is.null,usdc_bep20_address.not.is.null')
       .limit(200);
@@ -971,7 +1015,7 @@ async function handleCheckBEP20Deposits() {
           for (const tx of transactions) {
             try {
               const { data: existing } = await supabase
-                .from('deposit_requests')
+                .from('deposits')
                 .select('id, status')
                 .eq('tx_hash', tx.transaction_id)
                 .eq('network', tx.network)
@@ -983,7 +1027,7 @@ async function handleCheckBEP20Deposits() {
                 continue;
               }
 
-              const result = await processDeposit(wallet.user_id, tx.amount, tx.transaction_id, tx.network);
+              const result = await processDeposit(wallet.user_id, tx.amount, tx.transaction_id, tx.network, tx.to || address, tx.confirmed ? 1 : 0);
               if (result.success) {
                 depositsFound++;
                 console.log(`💰 NEW ${tx.network} DEPOSIT: $${tx.amount} ${tx.token} for user ${wallet.user_id}`);
@@ -1031,7 +1075,7 @@ async function handleCheckERC20Deposits() {
     console.log('🔄 Checking ERC20 deposits...');
 
     const { data: wallets, error } = await supabase
-      .from('user_wallets')
+      .from('deposit_wallets')
       .select('*')
       .or('usdt_erc20_address.not.is.null,usdc_erc20_address.not.is.null')
       .limit(200);
@@ -1056,7 +1100,7 @@ async function handleCheckERC20Deposits() {
           for (const tx of transactions) {
             try {
               const { data: existing } = await supabase
-                .from('deposit_requests')
+                .from('deposits')
                 .select('id, status')
                 .eq('tx_hash', tx.transaction_id)
                 .eq('network', tx.network)
@@ -1068,7 +1112,7 @@ async function handleCheckERC20Deposits() {
                 continue;
               }
 
-              const result = await processDeposit(wallet.user_id, tx.amount, tx.transaction_id, tx.network);
+              const result = await processDeposit(wallet.user_id, tx.amount, tx.transaction_id, tx.network, tx.to || address, tx.confirmed ? 1 : 0);
               if (result.success) {
                 depositsFound++;
                 console.log(`💰 NEW ${tx.network} DEPOSIT: $${tx.amount} ${tx.token} for user ${wallet.user_id}`);
@@ -1111,7 +1155,7 @@ async function handleCheckTRC20Deposits() {
     console.log('🔄 Checking TRC20 deposits...');
 
     const { data: wallets, error } = await supabase
-      .from('user_wallets')
+      .from('deposit_wallets')
       .select('*')
       .not('usdt_trc20_address', 'is', null)
       .limit(200);
@@ -1134,7 +1178,7 @@ async function handleCheckTRC20Deposits() {
           for (const tx of transactions) {
             try {
               const { data: existing } = await supabase
-                .from('deposit_requests')
+                .from('deposits')
                 .select('id, status')
                 .eq('tx_hash', tx.transaction_id)
                 .eq('network', tx.network)
@@ -1146,7 +1190,7 @@ async function handleCheckTRC20Deposits() {
                 continue;
               }
 
-              const result = await processDeposit(wallet.user_id, tx.amount, tx.transaction_id, tx.network);
+              const result = await processDeposit(wallet.user_id, tx.amount, tx.transaction_id, tx.network, tx.to || address, tx.confirmed ? 1 : 0);
               if (result.success) {
                 depositsFound++;
                 console.log(`💰 NEW ${tx.network} DEPOSIT: $${tx.amount} ${tx.token} for user ${wallet.user_id}`);
@@ -1189,7 +1233,7 @@ async function checkUserTRC20Deposits(userId) {
 
   try {
     const { data: wallet, error } = await supabase
-      .from('user_wallets')
+      .from('deposit_wallets')
       .select('*')
       .eq('user_id', userId)
       .maybeSingle();
@@ -1205,7 +1249,7 @@ async function checkUserTRC20Deposits(userId) {
 
       for (const tx of transactions) {
         try {
-          const result = await processDeposit(userId, tx.amount, tx.transaction_id, tx.network);
+          const result = await processDeposit(userId, tx.amount, tx.transaction_id, tx.network, tx.to || address, tx.confirmed ? 1 : 0);
           if (result?.success) {
             if (result.already_processed) summary.duplicates++;
             else summary.deposits++;
@@ -1231,7 +1275,7 @@ async function checkUserBEP20Deposits(userId) {
 
   try {
     const { data: wallet, error } = await supabase
-      .from('user_wallets')
+      .from('deposit_wallets')
       .select('*')
       .eq('user_id', userId)
       .maybeSingle();
@@ -1249,7 +1293,7 @@ async function checkUserBEP20Deposits(userId) {
 
       for (const tx of transactions) {
         try {
-          const result = await processDeposit(userId, tx.amount, tx.transaction_id, tx.network);
+          const result = await processDeposit(userId, tx.amount, tx.transaction_id, tx.network, tx.to || address, tx.confirmed ? 1 : 0);
           if (result?.success) {
             if (result.already_processed) {
               summary.duplicates++;
@@ -1280,7 +1324,7 @@ async function checkUserERC20Deposits(userId) {
 
   try {
     const { data: wallet, error } = await supabase
-      .from('user_wallets')
+      .from('deposit_wallets')
       .select('*')
       .eq('user_id', userId)
       .maybeSingle();
@@ -1298,7 +1342,7 @@ async function checkUserERC20Deposits(userId) {
 
       for (const tx of transactions) {
         try {
-          const result = await processDeposit(userId, tx.amount, tx.transaction_id, tx.network);
+          const result = await processDeposit(userId, tx.amount, tx.transaction_id, tx.network, tx.to || address, tx.confirmed ? 1 : 0);
           if (result?.success) {
             if (result.already_processed) summary.duplicates++;
             else summary.deposits++;
@@ -1366,7 +1410,8 @@ app.post('/api/deposit/generate', requireApiKey, async (req, res) => {
     console.log(`🔐 [SECURE] Generating ${network} wallet for user: ${user_id}, IP: ${req.ip}`);
 
     const result = await generateWallet(user_id, network);
-    return res.json(result);
+    await syncDepositAddress(user_id, result.network, result.address);
+    return res.json({ ...result, min_deposit: MIN_DEPOSIT });
   } catch (error) {
     console.error('❌ API Generate wallet error:', error.message);
     return res.status(500).json({ success: false, error: 'Internal server error' });
@@ -1398,7 +1443,6 @@ app.post('/public/deposit/generate', async (req, res) => {
       return res.status(400).json({ success: false, error: 'Unsupported network' });
     }
 
-    // ИСПРАВЛЕНИЕ ЗДЕСЬ: ищем по колонке 'id', а не 'user_id'
     const { data: user, error: userError } = await supabase
       .from('profiles')
       .select('id')
@@ -1416,6 +1460,7 @@ app.post('/public/deposit/generate', async (req, res) => {
     }
 
     const result = await generateWallet(user_id, network);
+    await syncDepositAddress(user_id, result.network, result.address);
 
     await safeSystemLog('public_deposit_generated', `Public deposit address generated for user ${user_id}`, {
       user_id,
@@ -1429,7 +1474,8 @@ app.post('/public/deposit/generate', async (req, res) => {
       success: true,
       address: result.address,
       network: result.network,
-      exists: result.exists
+      exists: result.exists,
+      min_deposit: MIN_DEPOSIT
     });
   } catch (error) {
     console.error('❌ [PUBLIC] Error:', error.message);
@@ -1510,6 +1556,35 @@ app.post('/public/deposit/check', userDepositCheckCooldownMiddleware, async (req
   }
 });
 
+
+// 4. Public/app endpoint: returns only the authenticated user's deposits.
+app.get('/public/deposit/history', async (req, res) => {
+  try {
+    const bearerUser = await getUserFromBearerToken(req);
+    if (!bearerUser?.id) {
+      return res.status(401).json({ success: false, error: 'Auth required' });
+    }
+
+    const network = String(readParam(req, 'network', '') || '').trim().toLowerCase();
+    let query = supabase
+      .from('deposits')
+      .select('id, asset, network, tx_hash, address, amount, status, confirmations, created_at, completed_at')
+      .eq('user_id', bearerUser.id)
+      .order('created_at', { ascending: false })
+      .limit(50);
+
+    if (network) query = query.eq('network', network);
+
+    const { data, error } = await query;
+    if (error) throw error;
+
+    return res.json({ success: true, deposits: data || [] });
+  } catch (error) {
+    console.error('❌ Public deposit history error:', error.message);
+    return res.status(500).json({ success: false, error: 'Failed to fetch deposit history' });
+  }
+});
+
 // 4. Public/admin endpoint: checks all deposits after Bearer auth + role/is_admin validation.
 // This keeps API_SECRET_KEY on the server and never exposes it to frontend.
 app.post('/public/admin/check-deposits', adminDepositCheckCooldownMiddleware, async (req, res) => {
@@ -1578,7 +1653,7 @@ app.get('/api/deposit/history', requireApiKey, async (req, res) => {
     }
 
     let query = supabase
-      .from('deposit_requests')
+      .from('deposits')
       .select('*')
       .eq('user_id', user_id)
       .order('created_at', { ascending: false })
@@ -1632,7 +1707,7 @@ const server = app.listen(PORT, '0.0.0.0', () => {
   console.log(`✅ SECURE Endpoint: GET  http://0.0.0.0:${PORT}/api/deposit/history (requires API key)`);
   console.log(`✅ SECURE Endpoint: GET  http://0.0.0.0:${PORT}/api/check-deposits (requires API key)`);
   console.log(`✅ RATE LIMIT: 60 requests per 15 minutes per IP`);
-  console.log(`✅ SUPABASE: CONNECTED`);
+  console.log(`✅ SUPABASE DEPOSIT STORAGE: CONNECTED`);
   console.log(`✅ MORALIS: ${MORALIS_API_KEY ? 'API KEY SET' : 'API KEY MISSING'}`);
   console.log(`✅ BEP20 (USDT & USDC): Checking every ${BEP20_CHECK_INTERVAL} ms`);
   console.log(`✅ ERC20 (USDT & USDC): Checking every ${ERC20_CHECK_INTERVAL} ms`);
