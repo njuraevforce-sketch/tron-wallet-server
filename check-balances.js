@@ -7,7 +7,7 @@ const { ethers } = require('ethers');
 const WebSocket = require('ws');
 
 const SUPABASE_URL =
-  process.env.SUPABASE_URL || 'https://fkjwueogfmdolcjtvvme.supabase.co';
+  process.env.SUPABASE_URL || 'https://dsfzbhrzritqxoupihxa.supabase.co';
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const TRONGRID_API_KEY = process.env.TRONGRID_API_KEY || '';
 
@@ -395,11 +395,11 @@ async function loadWalletsFromDatabase(supabase) {
   console.log('Loading wallets from DB...');
 
   const { data: wallets, error } = await supabase
-    .from('user_wallets')
+    .from('deposit_wallets')
     .select('*');
 
   if (error) {
-    throw new Error(`DB Error user_wallets: ${error.message}`);
+    throw new Error(`DB Error deposit_wallets: ${error.message}`);
   }
 
   const evmWallets = new Map();
@@ -436,7 +436,7 @@ async function loadWalletsFromDatabase(supabase) {
   // Fallback for old rows or rows where user_wallets.usdt_trc20_address is
   // missing, but private_keys still contains the public TRON address.
   const { data: privateKeys, error: pkError } = await supabase
-    .from('private_keys')
+    .from('deposit_private_keys')
     .select('user_id, network, address')
     .in('network', ['usdt_trc20', 'trx', 'trc_20', 'trc20', 'tron'])
     .not('address', 'is', null);
