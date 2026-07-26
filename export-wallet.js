@@ -3,7 +3,7 @@ const { createClient } = require('@supabase/supabase-js');
 const crypto = require('crypto');
 const WebSocket = require('ws'); // ИСПРАВЛЕНИЕ: Добавлен пакет ws
 
-const SUPABASE_URL = process.env.SUPABASE_URL || 'https://fkjwueogfmdolcjtvvme.supabase.co';
+const SUPABASE_URL = process.env.SUPABASE_URL || 'https://dsfzbhrzritqxoupihxa.supabase.co';
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const ENCRYPTION_KEY = process.env.ENCRYPTION_KEY;
 
@@ -16,7 +16,6 @@ const ALLOWED_NETWORKS = new Set([
   'usdt_trc20',
   'trc_20',
 ]);
-
 function fail(message, code = 1) {
   console.error(message);
   process.exit(code);
@@ -132,7 +131,7 @@ async function main() {
   });
 
   const { data, error } = await supabase
-    .from('private_keys')
+    .from('deposit_private_keys')
     .select('user_id, network, address, encrypted_private_key, created_at')
     .eq('user_id', userId)
     .eq('network', network)
