@@ -154,7 +154,7 @@ const adminDepositCheckCooldownMiddleware = createCooldownMiddleware(
 
 
 // ========== CONSTANTS ==========
-const MIN_DEPOSIT = 17;
+const MIN_DEPOSIT = 1;
 
 // BSC
 const USDT_BSC_CONTRACT = '0x55d398326f99059fF775485246999027B3197955';
