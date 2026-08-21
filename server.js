@@ -68,6 +68,7 @@ app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
   res.header('Access-Control-Allow-Headers', '*');
   res.header('Access-Control-Allow-Methods', '*');
+  res.header('Access-Control-Expose-Headers', 'Server-Timing, X-Response-Time');
   if (req.method === 'OPTIONS') return res.sendStatus(204);
   next();
 });
@@ -278,6 +279,15 @@ async function safeSystemLog(logType, message, metadata = {}) {
   } catch (error) {
     // intentionally swallow
   }
+}
+
+// Logging and reconciliation must never delay a user-facing address response.
+// Errors remain visible in Railway logs, while the critical wallet writes are
+// still awaited inside generateWallet().
+function runInBackground(label, task) {
+  Promise.resolve()
+    .then(task)
+    .catch((error) => console.warn(`⚠️ Background task failed (${label}):`, error.message));
 }
 
 
@@ -491,7 +501,7 @@ async function generateWallet(user_id, network) {
 
     const { data: existingWallet, error: walletError } = await supabase
       .from('deposit_wallets')
-      .select('*')
+      .select('user_id,usdt_bep20_address,usdc_bep20_address,usdt_erc20_address,usdc_erc20_address,usdt_trc20_address')
       .eq('user_id', user_id)
       .maybeSingle();
 
@@ -573,7 +583,11 @@ async function generateWallet(user_id, network) {
       const { error: pkError } = await supabase.from('deposit_private_keys').upsert(pkUpserts, { onConflict: 'user_id,network' });
       if (pkError) throw new Error('Failed to save private keys');
 
-      await safeSystemLog('deposit_wallet_generated', `Unified EVM Wallet generated for user ${user_id}`, { user_id, network, address });
+      runInBackground('deposit_wallet_generated', () => safeSystemLog(
+        'deposit_wallet_generated',
+        `Unified EVM Wallet generated for user ${user_id}`,
+        { user_id, network, address }
+      ));
       
       setTimeout(() => {
         if (network.includes('bep20')) checkUserBEP20Deposits(user_id).catch(e => console.error(e));
@@ -613,7 +627,11 @@ async function generateWallet(user_id, network) {
       }, { onConflict: 'user_id,network' });
       if (pkError) throw new Error('Failed to save TRON private key');
 
-      await safeSystemLog('deposit_wallet_generated', `TRON Wallet generated for user ${user_id}`, { user_id, network, address });
+      runInBackground('deposit_wallet_generated', () => safeSystemLog(
+        'deposit_wallet_generated',
+        `TRON Wallet generated for user ${user_id}`,
+        { user_id, network, address }
+      ));
       
       setTimeout(() => checkUserTRC20Deposits(user_id).catch(e => console.error(e)), 10000);
 
@@ -623,6 +641,24 @@ async function generateWallet(user_id, network) {
     console.error('❌ Generate wallet error:', error.message);
     throw error;
   }
+}
+
+// Two fast taps (or two frontend requests for different EVM assets) must share
+// one wallet-generation promise. This prevents duplicate key creation and lets
+// every caller receive the same persisted address.
+const walletGenerationInFlight = new Map();
+function generateWalletSingleFlight(userId, network) {
+  const family = network.includes('bep20') || network.includes('erc20') ? 'evm' : 'trc20';
+  const key = `${userId}:${family}`;
+  const active = walletGenerationInFlight.get(key);
+  if (active) return active;
+
+  const operation = generateWallet(userId, network)
+    .finally(() => {
+      if (walletGenerationInFlight.get(key) === operation) walletGenerationInFlight.delete(key);
+    });
+  walletGenerationInFlight.set(key, operation);
+  return operation;
 }
 
 // ========== DEPOSIT PROCESSING ==========
@@ -1395,9 +1431,10 @@ app.get('/api/health', (req, res) => {
 
 // 1. Protected endpoint (API key required)
 app.post('/api/deposit/generate', requireApiKey, async (req, res) => {
+  const requestStarted = process.hrtime.bigint();
   try {
     const user_id = readParam(req, 'user_id');
-    const network = readParam(req, 'network', 'usdt_bep20');
+    const network = String(readParam(req, 'network', 'usdt_bep20')).trim().toLowerCase();
 
     if (!user_id) {
       return res.status(400).json({ success: false, error: 'User ID is required' });
@@ -1409,9 +1446,20 @@ app.post('/api/deposit/generate', requireApiKey, async (req, res) => {
 
     console.log(`🔐 [SECURE] Generating ${network} wallet for user: ${user_id}, IP: ${req.ip}`);
 
-    const result = await generateWallet(user_id, network);
-    await syncDepositAddress(user_id, result.network, result.address);
-    return res.json({ ...result, min_deposit: MIN_DEPOSIT });
+    const walletStarted = process.hrtime.bigint();
+    const result = await generateWalletSingleFlight(user_id, network);
+    const walletMs = Number(process.hrtime.bigint() - walletStarted) / 1e6;
+
+    if (result.exists) {
+      runInBackground('deposit_address_sync', () => syncDepositAddress(user_id, result.network, result.address));
+    } else {
+      await syncDepositAddress(user_id, result.network, result.address);
+    }
+
+    const totalMs = Number(process.hrtime.bigint() - requestStarted) / 1e6;
+    res.set('Server-Timing', `wallet;dur=${walletMs.toFixed(1)}, total;dur=${totalMs.toFixed(1)}`);
+    res.set('X-Response-Time', `${totalMs.toFixed(1)}ms`);
+    return res.json({ ...result, min_deposit: MIN_DEPOSIT, timing_ms: Math.round(totalMs) });
   } catch (error) {
     console.error('❌ API Generate wallet error:', error.message);
     return res.status(500).json({ success: false, error: 'Internal server error' });
@@ -1421,9 +1469,12 @@ app.post('/api/deposit/generate', requireApiKey, async (req, res) => {
 // 2. Public/app endpoint
 // Requires Bearer auth and resolves user only from the token.
 app.post('/public/deposit/generate', async (req, res) => {
+  const requestStarted = process.hrtime.bigint();
   try {
-    const network = readParam(req, 'network', 'usdt_bep20');
+    const network = String(readParam(req, 'network', 'usdt_bep20')).trim().toLowerCase();
+    const authStarted = process.hrtime.bigint();
     const bearerUser = await getUserFromBearerToken(req);
+    const authMs = Number(process.hrtime.bigint() - authStarted) / 1e6;
 
     console.log('🔓 [PUBLIC] Deposit generation request:', {
       resolved_user_id: bearerUser?.id || null,
@@ -1443,49 +1494,51 @@ app.post('/public/deposit/generate', async (req, res) => {
       return res.status(400).json({ success: false, error: 'Unsupported network' });
     }
 
-    const { data: user, error: userError } = await supabase
-      .from('profiles')
-      .select('id')
-      .eq('id', user_id)
-      .maybeSingle();
+    // Supabase Auth already verified the caller and user_id is resolved only
+    // from that token. Critical wallet/private-key writes remain awaited; the
+    // second profiles read did not add any identity information.
+    const walletStarted = process.hrtime.bigint();
+    const result = await generateWalletSingleFlight(user_id, network);
+    const walletMs = Number(process.hrtime.bigint() - walletStarted) / 1e6;
 
-    if (userError) {
-      console.error('❌ [PUBLIC] User lookup error:', userError.message);
-      return res.status(500).json({ success: false, error: 'User lookup failed' });
+    const syncStarted = process.hrtime.bigint();
+    if (result.exists) {
+      runInBackground('public_deposit_address_sync', () => syncDepositAddress(user_id, result.network, result.address));
+    } else {
+      await syncDepositAddress(user_id, result.network, result.address);
     }
+    const syncMs = result.exists ? 0 : Number(process.hrtime.bigint() - syncStarted) / 1e6;
 
-    if (!user) {
-      console.log('❌ [PUBLIC] User not found:', user_id);
-      return res.status(404).json({ success: false, error: 'User not found' });
-    }
-
-    const result = await generateWallet(user_id, network);
-    await syncDepositAddress(user_id, result.network, result.address);
-
-    await safeSystemLog('public_deposit_generated', `Public deposit address generated for user ${user_id}`, {
+    runInBackground('public_deposit_generated', () => safeSystemLog('public_deposit_generated', `Public deposit address generated for user ${user_id}`, {
       user_id,
       network,
       address: result.address,
       ip: req.ip,
       bearer_auth: true
-    });
+    }));
+
+    const totalMs = Number(process.hrtime.bigint() - requestStarted) / 1e6;
+    res.set('Cache-Control', 'private, no-store');
+    res.set('Server-Timing', `auth;dur=${authMs.toFixed(1)}, wallet;dur=${walletMs.toFixed(1)}, sync;dur=${syncMs.toFixed(1)}, total;dur=${totalMs.toFixed(1)}`);
+    res.set('X-Response-Time', `${totalMs.toFixed(1)}ms`);
 
     return res.json({
       success: true,
       address: result.address,
       network: result.network,
       exists: result.exists,
-      min_deposit: MIN_DEPOSIT
+      min_deposit: MIN_DEPOSIT,
+      timing_ms: Math.round(totalMs)
     });
   } catch (error) {
     console.error('❌ [PUBLIC] Error:', error.message);
 
-    await safeSystemLog('public_deposit_error', `Public deposit error: ${error.message}`, {
+    runInBackground('public_deposit_error', () => safeSystemLog('public_deposit_error', `Public deposit error: ${error.message}`, {
       error: error.message,
       ip: req.ip,
       body: req.body || null,
       query: req.query || null
-    });
+    }));
 
     return res.status(500).json({ success: false, error: 'Internal server error' });
   }
