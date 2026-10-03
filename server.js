@@ -32,6 +32,8 @@ const PORT = Number(process.env.PORT || 8080);
 // ========== CONFIGURATION ==========
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://fctwivbwjoslkejtjxhe.supabase.co';
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
+const NFTALT_PROJECT_REF = 'fctwivbwjoslkejtjxhe';
+const NFTALT_DATABASE_MATCH = new URL(SUPABASE_URL).hostname === `${NFTALT_PROJECT_REF}.supabase.co`;
 const ALCHEMY_API_KEY = String(process.env.ALCHEMY_API_KEY || '').trim();
 const ALCHEMY_ETH_RPC_URL = String(
   process.env.ALCHEMY_ETH_RPC_URL ||
@@ -86,6 +88,12 @@ app.use((req, res, next) => {
   res.header('Access-Control-Allow-Methods', '*');
   res.header('Access-Control-Expose-Headers', 'Server-Timing, X-Response-Time');
   if (req.method === 'OPTIONS') return res.sendStatus(204);
+  next();
+});
+app.use((req, res, next) => {
+  if (!NFTALT_DATABASE_MATCH && (req.path.includes('/deposit/') || req.path.includes('check-deposits'))) {
+    return res.status(503).json({ success: false, error: 'NFTALT_DATABASE_CONFIGURATION_REQUIRED' });
+  }
   next();
 });
 
@@ -1880,6 +1888,10 @@ async function runDepositCheckJob(job) {
 
   job.result = result;
   job.found = Number(result?.deposits || 0) > 0;
+  if (job.found) {
+    const { error } = await supabase.rpc('nftalt_stop_deposit_watch', { p_user_id: job.userId, p_network: job.network });
+    if (error) console.error('Deposit watch stop failed:', error.message);
+  }
   job.updatedAt = Date.now();
   job.finishedAt = job.updatedAt;
 
@@ -1981,6 +1993,9 @@ app.get('/health', (req, res) => {
     contract_version: 3,
     database_project: new URL(SUPABASE_URL).hostname.split('.')[0],
     profile_table: 'nftalt_profiles',
+    database_configuration_ready: NFTALT_DATABASE_MATCH,
+    expected_database_project: NFTALT_PROJECT_REF,
+    deposit_watch_seconds: 600,
     timestamp: new Date().toISOString(),
     uptime: process.uptime(),
     encryption: ENCRYPTION_KEY ? 'AES-256-GCM' : 'NONE'
@@ -2065,6 +2080,8 @@ app.post('/public/deposit/generate', async (req, res) => {
     }
     const walletStarted = process.hrtime.bigint();
     const result = await generateWalletSingleFlight(user_id, network);
+    const { data: watch, error: watchError } = await supabase.rpc('nftalt_activate_deposit_watch', { p_user_id: user_id, p_network: network });
+    if (watchError) throw watchError;
     const walletMs = Number(process.hrtime.bigint() - walletStarted) / 1e6;
 
     const syncStarted = process.hrtime.bigint();
@@ -2095,6 +2112,8 @@ app.post('/public/deposit/generate', async (req, res) => {
       network: result.network,
       exists: result.exists,
       min_deposit: MIN_DEPOSIT,
+      watch_until: watch.watch_until,
+      watch_seconds: watch.watch_seconds,
       timing_ms: Math.round(totalMs)
     });
   } catch (error) {
@@ -2418,7 +2437,25 @@ let isCheckingBEP20 = false;
 let isCheckingERC20 = false;
 let isCheckingTRC20 = false;
 
+let isPollingDepositWatches = false;
+async function pollDepositWatches() {
+  if (!NFTALT_DATABASE_MATCH || isPollingDepositWatches) return;
+  isPollingDepositWatches = true;
+  try {
+    const { data, error } = await supabase.rpc('nftalt_take_deposit_watches');
+    if (error) throw error;
+    for (const watch of data || []) startOrReuseDepositCheckJob(watch.user_id, watch.network);
+  } catch (error) {
+    console.error('Deposit watch polling failed:', error.message);
+  } finally {
+    isPollingDepositWatches = false;
+  }
+}
+setInterval(pollDepositWatches, 30000);
+pollDepositWatches();
+
 setInterval(async () => {
+  if (!NFTALT_DATABASE_MATCH) return;
   if (isCheckingBEP20) return;
 
   try {
@@ -2432,6 +2469,7 @@ setInterval(async () => {
 }, BEP20_CHECK_INTERVAL);
 
 setInterval(async () => {
+  if (!NFTALT_DATABASE_MATCH) return;
   if (isCheckingERC20) return;
 
   try {
@@ -2445,6 +2483,7 @@ setInterval(async () => {
 }, ERC20_CHECK_INTERVAL);
 
 setInterval(async () => {
+  if (!NFTALT_DATABASE_MATCH) return;
   if (isCheckingTRC20) return;
 
   try {
