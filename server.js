@@ -30,7 +30,7 @@ app.set('trust proxy', true);
 const PORT = Number(process.env.PORT || 8080);
 
 // ========== CONFIGURATION ==========
-const SUPABASE_URL = process.env.SUPABASE_URL || 'https://fkjwueogfmdolcjtvvme.supabase.co';
+const SUPABASE_URL = process.env.SUPABASE_URL || 'https://fctwivbwjoslkejtjxhe.supabase.co';
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const ALCHEMY_API_KEY = String(process.env.ALCHEMY_API_KEY || '').trim();
 const ALCHEMY_ETH_RPC_URL = String(
@@ -1977,7 +1977,10 @@ app.get('/', (req, res) => {
 app.get('/health', (req, res) => {
   res.json({
     status: '✅ HEALTHY',
-    service: 'Oracle Deposit Processor',
+    service: 'NFTALT Deposit Processor',
+    contract_version: 3,
+    database_project: new URL(SUPABASE_URL).hostname.split('.')[0],
+    profile_table: 'nftalt_profiles',
     timestamp: new Date().toISOString(),
     uptime: process.uptime(),
     encryption: ENCRYPTION_KEY ? 'AES-256-GCM' : 'NONE'
@@ -2254,7 +2257,7 @@ app.post('/public/admin/check-deposits', adminDepositCheckCooldownMiddleware, as
     }
 
     const { data: profile, error: profileError } = await supabase
-      .from('profiles')
+      .from('nftalt_profiles')
       .select('*')
       .eq('id', bearerUser.id)
       .maybeSingle();
