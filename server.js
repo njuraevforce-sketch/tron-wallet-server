@@ -186,7 +186,8 @@ const adminDepositCheckCooldownMiddleware = createCooldownMiddleware(
 
 
 // ========== CONSTANTS ==========
-const MIN_DEPOSIT = 1;
+const MIN_SCAN_AMOUNT = 1;
+const MIN_DEPOSIT = 30;
 
 // BSC
 const USDT_BSC_CONTRACT = '0x55d398326f99059fF775485246999027B3197955';
@@ -691,8 +692,8 @@ async function processDeposit(userId, amount, txid, network, address = null, con
     const hash = String(txid || '').trim().toLowerCase().replace(/^0x/, '');
     const normalizedTxid = normalizedNetwork.endsWith('_trc20') ? hash : '0x' + hash;
     const normalizedEventIndex = normalizeEventIndex(eventIndex);
-    if (!Number.isFinite(Number(amount)) || Number(amount) < MIN_DEPOSIT) {
-      return { success: false, error: 'Minimum deposit is $' + MIN_DEPOSIT };
+    if (!Number.isFinite(Number(amount)) || Number(amount) < MIN_SCAN_AMOUNT) {
+      return { success: false, error: 'Transfer is below the scan threshold' };
     }
 
     const legacyDeposit = await findLegacyEventZeroDeposit(
@@ -1086,7 +1087,7 @@ async function scanAlchemyLogTransfers(chainKey, addresses, mode = 'manual', opt
       const fromAddress = evmAddressFromTopic(log?.topics?.[1]);
       const rawAmount = BigInt(String(log?.data || '0x0'));
       const amount = Number(ethers.formatUnits(rawAmount, token.decimals));
-      if (!Number.isFinite(amount) || amount < MIN_DEPOSIT) continue;
+      if (!Number.isFinite(amount) || amount < MIN_SCAN_AMOUNT) continue;
 
       const blockNumber = safeRpcNumber(log?.blockNumber, 'log block number');
       const blockHex = rpcHexNumber(blockNumber);
@@ -1187,7 +1188,7 @@ async function getAlchemyERC20AssetTransfers(address, network = '') {
         if (rawValue != null && String(rawValue) !== '') {
           amount = Number(ethers.formatUnits(BigInt(String(rawValue)), token.decimals));
         }
-        if (!Number.isFinite(amount) || amount < MIN_DEPOSIT) continue;
+        if (!Number.isFinite(amount) || amount < MIN_SCAN_AMOUNT) continue;
 
         const transactionId = String(transfer?.hash || '').toLowerCase();
         if (!/^0x[0-9a-f]{64}$/.test(transactionId)) continue;
@@ -1289,7 +1290,7 @@ async function getTRC20Transactions(address) {
 
         if (tokenSymbol !== 'USDT') continue;
         if (!confirmed) continue;
-        if (!Number.isFinite(amount) || amount < MIN_DEPOSIT) continue;
+        if (!Number.isFinite(amount) || amount < MIN_SCAN_AMOUNT) continue;
 
         transactions.push({
           transaction_id: String(tx.transaction_id || tx.hash || ''),
@@ -2111,7 +2112,7 @@ app.post('/public/deposit/generate', async (req, res) => {
       wallet: result.wallet,
       network: result.network,
       exists: result.exists,
-      min_deposit: MIN_DEPOSIT,
+      min_deposit: Number(req.pixelState?.config?.min_deposit || MIN_DEPOSIT),
       watch_until: watch.watch_until,
       watch_seconds: watch.watch_seconds,
       timing_ms: Math.round(totalMs)
