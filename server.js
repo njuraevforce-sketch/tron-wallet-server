@@ -14,6 +14,8 @@
 //   so deposits older than the former 600-block window are not skipped.
 // - V7: selected-network checks run as single-flight background jobs with
 //   progress polling and a process-wide Alchemy 429 protection gate.
+// - V8: live watches check after one minute, then every 90 seconds. Historical
+//   recovery runs separately in small slices and yields to live checks.
 // - PixelNFT compatibility: atomic database RPCs, credited/reversed statuses,
 //   encrypted key envelopes and existing PixelNFT app/admin API contracts.
 //   Atomic crediting, confirmation flags, scan timers and BEP20 sweep flow
@@ -259,6 +261,11 @@ const ALCHEMY_RATE_LIMIT_PAUSE_MS = boundedEnvInteger('ALCHEMY_RATE_LIMIT_PAUSE_
 const DEPOSIT_CHECK_JOB_TTL_MS = boundedEnvInteger('DEPOSIT_CHECK_JOB_TTL_MS', 15 * 60 * 1000, 60 * 1000, 60 * 60 * 1000);
 const DEPOSIT_CHECK_RESULT_REUSE_MS = boundedEnvInteger('DEPOSIT_CHECK_RESULT_REUSE_MS', 60 * 1000, 5 * 1000, 5 * 60 * 1000);
 const DEPOSIT_CHECK_JOB_CONCURRENCY = boundedEnvInteger('DEPOSIT_CHECK_JOB_CONCURRENCY', 2, 1, 10);
+const DEPOSIT_WATCH_CHECK_INTERVAL_MS = 90000;
+const DEPOSIT_WATCH_FIRST_CHECK_DELAY_MS = 60000;
+const DEPOSIT_HISTORY_SLICE_BLOCKS = boundedEnvInteger('DEPOSIT_HISTORY_SLICE_BLOCKS', 50, 10, 200);
+const ALCHEMY_BSC_WATCH_LOOKBACK_BLOCKS = boundedEnvInteger('ALCHEMY_BSC_WATCH_LOOKBACK_BLOCKS', 120, 20, 600);
+const ALCHEMY_ETH_WATCH_LOOKBACK_BLOCKS = boundedEnvInteger('ALCHEMY_ETH_WATCH_LOOKBACK_BLOCKS', 24, 12, 300);
 
 // ========== HELPERS ==========
 function sleep(ms) {
@@ -615,12 +622,8 @@ async function generateWallet(user_id, network) {
       'deposit_wallet_generated', 'Deposit wallets generated for user ' + user_id,
       { user_id, network, address }
     ));
-    setTimeout(() => {
-      const options = { network };
-      if (network.includes('bep20')) checkUserBEP20Deposits(user_id, options).catch(console.error);
-      if (network.includes('erc20')) checkUserERC20Deposits(user_id, options).catch(console.error);
-      if (network.includes('trc20')) checkUserTRC20Deposits(user_id, options).catch(console.error);
-    }, 10000);
+    // Creating an address does not launch an independent scan. The durable
+    // ten-minute watch owns the first check and all subsequent checks.
   }
   return { success: true, address, exists: !!exists, network, wallet };
 }
@@ -746,6 +749,9 @@ async function processDepositAtomic(userId, amount, txid, network, address = nul
   if (!result || result.success !== true) throw new Error(result?.error || 'Deposit processing failed');
   const alreadyProcessed = result.already_processed === true || result.duplicate === true;
   if (!alreadyProcessed) {
+    // Credit from any scanner ends the active watch, including the normal
+    // background scanner. The financial RPC above remains the source of truth.
+    await recordDepositWatchDetection(userId, network);
     await safeSystemLog('deposit_atomic_success', 'Atomic deposit successful for user ' + userId, {
       deposit_id: result.deposit_id, user_id: userId, amount: result.amount,
       old_balance: result.old_balance, new_balance: result.new_balance,
@@ -1029,6 +1035,8 @@ async function scanAlchemyLogTransfers(chainKey, addresses, mode = 'manual', opt
 
   async function logWorker() {
     while (nextRequestIndex < logRequests.length) {
+      if (mode === 'background') await waitForLiveDepositChecks();
+      if (typeof options.beforeRequest === 'function') await options.beforeRequest();
       const requestIndex = nextRequestIndex++;
       const { fromBlock, toBlock, addressChunk } = logRequests[requestIndex];
       const destinationTopics = addressChunk.map(evmAddressTopic);
@@ -1608,6 +1616,7 @@ async function checkUserTRC20Deposits(userId, options = {}) {
 }
 
 async function checkUserBEP20Deposits(userId, options = {}) {
+  if (options.live) return checkUserEVMLiveDeposits(userId, 'bsc', options);
   const summary = { success: true, network_group: 'bep20', checked: 0, deposits: 0, duplicates: 0, errors: 0 };
 
   try {
@@ -1733,6 +1742,7 @@ async function checkUserBEP20Deposits(userId, options = {}) {
 }
 
 async function checkUserERC20Deposits(userId, options = {}) {
+  if (options.live) return checkUserEVMLiveDeposits(userId, 'eth', options);
   const summary = { success: true, network_group: 'erc20', checked: 0, deposits: 0, duplicates: 0, errors: 0 };
 
   try {
@@ -1814,6 +1824,242 @@ const depositCheckJobs = new Map();
 const activeDepositCheckJobByUser = new Map();
 const depositCheckQueue = [];
 let runningDepositCheckJobs = 0;
+const activeDepositWatches = new Map();
+const completedDepositWatches = new Map();
+const evmLiveScanCursors = new Map();
+const depositHistoryRecoveries = new Map();
+let runningDepositHistoryRecovery = false;
+
+function depositCheckKey(userId, network) {
+  return `${userId}:${network}`;
+}
+
+function nextScheduledWatchCheck(watch, after) {
+  const first = watch.until - 600000 + DEPOSIT_WATCH_FIRST_CHECK_DELAY_MS;
+  return after < first ? first : first + (Math.floor((after - first) / DEPOSIT_WATCH_CHECK_INTERVAL_MS) + 1) * DEPOSIT_WATCH_CHECK_INTERVAL_MS;
+}
+
+function registerActiveDepositWatch(userId, network, deadline, restart = false) {
+  const until = Date.parse(deadline);
+  if (!Number.isFinite(until) || until <= Date.now()) return;
+  const key = depositCheckKey(userId, network);
+  if (!restart && (completedDepositWatches.get(key)?.until || 0) >= until) return;
+  if (restart) completedDepositWatches.delete(key);
+  // The durable wallet row has one selected watch network per user.
+  for (const [otherKey, watch] of activeDepositWatches) {
+    if (watch.userId === userId && otherKey !== key) activeDepositWatches.delete(otherKey);
+  }
+  const existing = activeDepositWatches.get(key);
+  if (existing && !restart) {
+    existing.until = Math.max(existing.until, until);
+    return;
+  }
+  const watch = { userId, network, until, nextCheckAt: 0 };
+  const first = until - 600000 + DEPOSIT_WATCH_FIRST_CHECK_DELAY_MS;
+  watch.nextCheckAt = restart || Date.now() < first ? first
+    : first + Math.floor((Date.now() - first) / DEPOSIT_WATCH_CHECK_INTERVAL_MS) * DEPOSIT_WATCH_CHECK_INTERVAL_MS;
+  activeDepositWatches.set(key, watch);
+  if (restart) evmLiveScanCursors.delete(key);
+  const lastJob = depositCheckJobs.get(activeDepositCheckJobByUser.get(key));
+  if (restart && lastJob?.found && !['queued', 'running'].includes(lastJob.status)) {
+    activeDepositCheckJobByUser.delete(key);
+  }
+}
+
+async function waitForLiveDepositChecks() {
+  // History never occupies a live job slot. At most its current provider
+  // request remains in flight when a new live check starts.
+  while (runningDepositCheckJobs > 0) await sleep(100);
+}
+
+async function creditLiveScanTransfers(userId, transactions, summary) {
+  summary.checked += transactions.length;
+  for (const tx of transactions) {
+    try {
+      const result = await processDeposit(userId, tx.amount, tx.transaction_id, tx.network, tx.to, tx.confirmed ? 1 : 0, tx.event_index);
+      if (!result?.success) throw new Error(result?.error || 'Deposit processing failed');
+      if (result.already_processed) summary.duplicates++;
+      else {
+        summary.deposits++;
+        if (tx.network.endsWith('_bep20')) sweepDepositBEP20(userId, tx.token, tx.network).catch(console.error);
+      }
+    } catch (error) {
+      summary.errors++;
+      console.error('Live deposit credit failed:', error.message);
+    }
+  }
+}
+
+async function finishActiveDepositWatch(userId, network) {
+  const key = depositCheckKey(userId, network);
+  const watch = activeDepositWatches.get(key);
+  if (!watch && completedDepositWatches.has(key)) return;
+  if (watch) completedDepositWatches.set(key, { until: watch.until, detectedAt: Date.now() });
+  activeDepositWatches.delete(key);
+  depositHistoryRecoveries.delete(key);
+  const { error } = await supabase.rpc('nftalt_stop_deposit_watch', { p_user_id: userId, p_network: network });
+  if (error) console.error('Deposit watch stop failed:', error.message);
+}
+
+async function recordDepositWatchDetection(userId, network) {
+  const key = depositCheckKey(userId, network);
+  if (!activeDepositWatches.has(key)) return;
+  const job = depositCheckJobs.get(activeDepositCheckJobByUser.get(key));
+  if (job) { job.found = true; job.phase = 'credited'; job.updatedAt = Date.now(); }
+  await finishActiveDepositWatch(userId, network);
+}
+
+async function resolveActiveDepositWatch(userId, network) {
+  const key = depositCheckKey(userId, network);
+  let watch = activeDepositWatches.get(key);
+  if (!watch && !completedDepositWatches.has(key)) {
+    const { data: wallet, error } = await supabase.from('deposit_wallets').select('watch_network,watch_until').eq('user_id', userId).maybeSingle();
+    if (error) throw error;
+    if (wallet?.watch_network === network) registerActiveDepositWatch(userId, network, wallet.watch_until);
+    watch = activeDepositWatches.get(key);
+  }
+  return watch && watch.until > Date.now() ? watch : null;
+}
+
+function publicDepositWatchState(userId, network) {
+  const key = depositCheckKey(userId, network);
+  const watch = activeDepositWatches.get(key);
+  const completed = completedDepositWatches.get(key);
+  const job = depositCheckJobs.get(activeDepositCheckJobByUser.get(key));
+  if (completed && completed.until > Date.now()) return {
+    success: true, job_status: 'completed', job_id: job?.id || null, checking: false, found: true,
+    last_checked_at: new Date(completed.detectedAt).toISOString(), next_check_at: null
+  };
+  if (job && (job.status === 'running' || job.status === 'queued')) return publicDepositCheckJob(job, true);
+  if (!watch || watch.until <= Date.now()) return { success: true, job_status: 'expired', checking: false, found: false };
+  if (job) return publicDepositCheckJob(job, true);
+  return { success: true, job_status: 'waiting', checking: false, found: false,
+    check_interval_seconds: DEPOSIT_WATCH_CHECK_INTERVAL_MS / 1000, next_check_at: new Date(watch.nextCheckAt).toISOString() };
+}
+
+function scheduleDepositHistoryRecovery(userId, network, chainKey, addresses, fromBlock, toBlock) {
+  if (fromBlock > toBlock) return;
+  const key = depositCheckKey(userId, network);
+  const watch = activeDepositWatches.get(key);
+  if (!watch || watch.until <= Date.now()) return;
+  let recovery = depositHistoryRecoveries.get(key);
+  if (!recovery) {
+    recovery = { key, userId, network, chainKey, addresses, fromBlock, nextToBlock: toBlock, retryAt: 0 };
+    depositHistoryRecoveries.set(key, recovery);
+  } else {
+    recovery.fromBlock = Math.min(recovery.fromBlock, fromBlock);
+    recovery.nextToBlock = Math.max(recovery.nextToBlock, toBlock);
+  }
+  // Let the live job finish before the history worker asks for a request slot.
+  setTimeout(drainDepositHistoryRecovery, 0);
+}
+
+async function checkUserEVMLiveDeposits(userId, chainKey, options = {}) {
+  const group = chainKey === 'bsc' ? 'bep20' : 'erc20';
+  const network = String(options.network || '').trim().toLowerCase();
+  const summary = { success: true, network_group: group, checked: 0, deposits: 0, duplicates: 0, errors: 0 };
+  try {
+    if (!network.endsWith('_' + group) || !networkFields[network]) throw new Error('Unsupported live network');
+    const { data: wallet, error } = await supabase.from('deposit_wallets').select('*').eq('user_id', userId).maybeSingle();
+    if (error) throw error;
+    if (!wallet) return summary;
+    const address = normalizeEvmAddress(wallet[networkFields[network].addressField]);
+    if (!address) throw new Error('Invalid deposit address');
+    const chain = ALCHEMY_CHAIN_CONFIG[chainKey];
+    const latestBlock = safeRpcNumber(await alchemyRpc(chainKey, 'eth_blockNumber', []), 'latest block');
+    const head = latestBlock - chain.confirmations;
+    if (head < 0) return summary;
+    const key = depositCheckKey(userId, network);
+    const lookback = chainKey === 'bsc' ? ALCHEMY_BSC_WATCH_LOOKBACK_BLOCKS : ALCHEMY_ETH_WATCH_LOOKBACK_BLOCKS;
+    const cursor = evmLiveScanCursors.get(key);
+    const recentFrom = Math.max(0, head - lookback + 1);
+    const fromBlock = cursor && cursor.block <= head
+      ? Math.max(recentFrom, cursor.block - chain.reorgOverlap + 1)
+      : recentFrom;
+    const blocks = head - fromBlock + 1;
+    options.onProgress?.({ phase: 'recent', scannedBlocks: 0, totalBlocks: blocks });
+    const scan = await scanAlchemyLogTransfers(chainKey, [address], 'manual', {
+      fromBlock, toBlock: head, network, concurrency: ALCHEMY_BSC_USER_SCAN_CONCURRENCY,
+      onProgress: ({ completedRequests, totalRequests }) => options.onProgress?.({
+        phase: 'recent', scannedBlocks: Math.ceil(blocks * completedRequests / totalRequests), totalBlocks: blocks
+      })
+    });
+    await creditLiveScanTransfers(userId, scan.transactions, summary);
+    if (summary.errors) throw new Error('DEPOSIT_PROCESSING_FAILED');
+    // A failed scan/credit never advances this cursor.
+    evmLiveScanCursors.set(key, { block: head, usedAt: Date.now() });
+    summary.scanned_blocks = blocks;
+    summary.total_blocks = blocks;
+    if (!summary.deposits) {
+      const historyFrom = Math.max(0, head - chain.initialLookback + 1);
+      if (!cursor || cursor.block > head) {
+        scheduleDepositHistoryRecovery(userId, network, chainKey, [address], historyFrom, fromBlock - 1);
+      } else if (cursor.block + 1 < fromBlock) {
+        // A long outage may exceed the live tail; recover that gap separately.
+        scheduleDepositHistoryRecovery(userId, network, chainKey, [address], cursor.block + 1, fromBlock - 1);
+      }
+    }
+    return summary;
+  } catch (error) {
+    summary.success = false;
+    summary.error = error.message;
+    return summary;
+  }
+}
+
+async function drainDepositHistoryRecovery() {
+  if (runningDepositHistoryRecovery || !depositHistoryRecoveries.size) return;
+  runningDepositHistoryRecovery = true;
+  try {
+    // Rotate wallets after each slice; one older wallet cannot monopolize RPC.
+    for (const [key, recovery] of depositHistoryRecoveries) {
+      const watch = activeDepositWatches.get(key);
+      if (!watch || watch.until <= Date.now() || recovery.nextToBlock < recovery.fromBlock) {
+        depositHistoryRecoveries.delete(key);
+        continue;
+      }
+      if (recovery.retryAt > Date.now()) continue;
+      const fromBlock = Math.max(recovery.fromBlock, recovery.nextToBlock - DEPOSIT_HISTORY_SLICE_BLOCKS + 1);
+      const summary = { checked: 0, deposits: 0, duplicates: 0, errors: 0 };
+      try {
+        const scan = await scanAlchemyLogTransfers(recovery.chainKey, recovery.addresses, 'manual', {
+          fromBlock, toBlock: recovery.nextToBlock, network: recovery.network, concurrency: 1,
+          beforeRequest: async () => {
+            await waitForLiveDepositChecks();
+            const currentWatch = activeDepositWatches.get(key);
+            if (!currentWatch || currentWatch.until <= Date.now()) throw new Error('DEPOSIT_WATCH_ENDED');
+          }
+        });
+        await creditLiveScanTransfers(recovery.userId, scan.transactions, summary);
+        if (summary.errors) throw new Error('DEPOSIT_PROCESSING_FAILED');
+        recovery.nextToBlock = fromBlock - 1;
+        if (summary.deposits) {
+          const job = depositCheckJobs.get(activeDepositCheckJobByUser.get(key));
+          if (job) {
+            job.found = true;
+            job.phase = 'credited';
+            job.updatedAt = Date.now();
+            job.result = { ...(job.result || {}), deposits: Number(job.result?.deposits || 0) + summary.deposits };
+          }
+          await finishActiveDepositWatch(recovery.userId, recovery.network);
+          depositHistoryRecoveries.delete(key);
+          console.log(`✅ Deposit history recovery credited ${summary.deposits} transfer(s) on ${recovery.network}`);
+        }
+      } catch (error) {
+        if (error.message === 'DEPOSIT_WATCH_ENDED') {
+          depositHistoryRecoveries.delete(key);
+          continue;
+        }
+        // Retain the exact failed range, including financial processing errors.
+        recovery.retryAt = Date.now() + DEPOSIT_WATCH_CHECK_INTERVAL_MS;
+        console.error('Deposit history slice will retry:', error.message);
+      }
+    }
+  } finally {
+    runningDepositHistoryRecovery = false;
+    if (depositHistoryRecoveries.size) setTimeout(drainDepositHistoryRecovery, 1000);
+  }
+}
 
 function cleanupDepositCheckJobs() {
   const now = Date.now();
@@ -1821,8 +2067,9 @@ function cleanupDepositCheckJobs() {
     if (job.status === 'queued' || job.status === 'running') continue;
     if (now - job.updatedAt <= DEPOSIT_CHECK_JOB_TTL_MS) continue;
     depositCheckJobs.delete(jobId);
-    if (activeDepositCheckJobByUser.get(job.userId) === jobId) {
-      activeDepositCheckJobByUser.delete(job.userId);
+    const key = depositCheckKey(job.userId, job.network);
+    if (activeDepositCheckJobByUser.get(key) === jobId) {
+      activeDepositCheckJobByUser.delete(key);
     }
   }
 }
@@ -1842,6 +2089,7 @@ function updateDepositCheckJobProgress(job, progress = {}) {
 function publicDepositCheckJob(job, reused = false) {
   const result = job.result || {};
   const checking = job.status === 'queued' || job.status === 'running';
+  const watch = activeDepositWatches.get(depositCheckKey(job.userId, job.network));
   return {
     success: true,
     job_id: job.id,
@@ -1860,6 +2108,10 @@ function publicDepositCheckJob(job, reused = false) {
     deposits: Number(result.deposits || 0),
     duplicates: Number(result.duplicates || 0),
     error_code: job.errorCode || null,
+    check_interval_seconds: DEPOSIT_WATCH_CHECK_INTERVAL_MS / 1000,
+    last_checked_at: job.finishedAt ? new Date(job.finishedAt).toISOString() : null,
+    next_check_at: watch && !checking ? new Date(watch.nextCheckAt || Date.now() + DEPOSIT_WATCH_CHECK_INTERVAL_MS).toISOString() : null,
+    history_checking: depositHistoryRecoveries.has(depositCheckKey(job.userId, job.network)),
     created_at: new Date(job.createdAt).toISOString(),
     updated_at: new Date(job.updatedAt).toISOString()
   };
@@ -1875,7 +2127,8 @@ async function runDepositCheckJob(job) {
   job.updatedAt = Date.now();
 
   const onProgress = (progress) => updateDepositCheckJobProgress(job, progress);
-  let result = await checkUserRequestedNetworks(job.userId, job.network, { onProgress });
+  console.log(`🔎 Live deposit check started: ${job.network}, job ${job.id}`);
+  let result = await checkUserRequestedNetworks(job.userId, job.network, { onProgress, live: true });
 
   // A provider-side burst can still happen during platform-wide traffic. Wait
   // once and resume automatically instead of asking the user to press again.
@@ -1884,17 +2137,21 @@ async function runDepositCheckJob(job) {
     job.updatedAt = Date.now();
     pauseAlchemyLogRequests(ALCHEMY_RATE_LIMIT_PAUSE_MS);
     await sleep(ALCHEMY_RATE_LIMIT_PAUSE_MS);
-    result = await checkUserRequestedNetworks(job.userId, job.network, { onProgress });
+    result = await checkUserRequestedNetworks(job.userId, job.network, { onProgress, live: true });
   }
 
-  job.result = result;
-  job.found = Number(result?.deposits || 0) > 0;
+  // History may have credited a transfer while this live request was in flight.
+  const recoveredDeposits = Number(job.result?.deposits || 0);
+  job.result = { ...result, deposits: Number(result?.deposits || 0) + recoveredDeposits };
+  job.found = job.found || Number(job.result.deposits) > 0;
   if (job.found) {
-    const { error } = await supabase.rpc('nftalt_stop_deposit_watch', { p_user_id: job.userId, p_network: job.network });
-    if (error) console.error('Deposit watch stop failed:', error.message);
+    await finishActiveDepositWatch(job.userId, job.network);
   }
   job.updatedAt = Date.now();
   job.finishedAt = job.updatedAt;
+  const watch = activeDepositWatches.get(depositCheckKey(job.userId, job.network));
+  if (watch) watch.nextCheckAt = nextScheduledWatchCheck(watch, job.finishedAt);
+  console.log(`✅ Live deposit check finished: ${job.network}, ${Date.now() - job.createdAt}ms, ${job.result.deposits} new transfer(s)`);
 
   if (result?.success) {
     job.status = 'completed';
@@ -1914,6 +2171,13 @@ function drainDepositCheckQueue() {
     const jobId = depositCheckQueue.shift();
     const job = depositCheckJobs.get(jobId);
     if (!job || job.status !== 'queued') continue;
+    const watch = activeDepositWatches.get(depositCheckKey(job.userId, job.network));
+    if (job.watchUntil && (!watch || watch.until <= Date.now())) {
+      job.status = job.found ? 'completed' : 'expired';
+      job.phase = job.found ? 'credited' : 'expired';
+      job.finishedAt = job.updatedAt = Date.now();
+      continue;
+    }
     runningDepositCheckJobs++;
     runDepositCheckJob(job)
       .catch((error) => {
@@ -1935,11 +2199,12 @@ function drainDepositCheckQueue() {
 
 function startOrReuseDepositCheckJob(userId, network) {
   cleanupDepositCheckJobs();
-  const existingId = activeDepositCheckJobByUser.get(userId);
+  const key = depositCheckKey(userId, network);
+  const existingId = activeDepositCheckJobByUser.get(key);
   const existing = existingId ? depositCheckJobs.get(existingId) : null;
   if (existing) {
     const running = existing.status === 'queued' || existing.status === 'running';
-    const recentlyFinished = existing.finishedAt && Date.now() - existing.finishedAt < DEPOSIT_CHECK_RESULT_REUSE_MS;
+    const recentlyFinished = existing.finishedAt && Date.now() - existing.finishedAt < Math.min(DEPOSIT_CHECK_RESULT_REUSE_MS, DEPOSIT_WATCH_CHECK_INTERVAL_MS);
     if (running || (existing.network === network && recentlyFinished)) return { job: existing, reused: true };
   }
 
@@ -1958,10 +2223,11 @@ function startOrReuseDepositCheckJob(userId, network) {
     errorCode: null,
     createdAt: now,
     updatedAt: now,
-    finishedAt: null
+    finishedAt: null,
+    watchUntil: activeDepositWatches.get(key)?.until || null
   };
   depositCheckJobs.set(job.id, job);
-  activeDepositCheckJobByUser.set(userId, job.id);
+  activeDepositCheckJobByUser.set(key, job.id);
   depositCheckQueue.push(job.id);
   drainDepositCheckQueue();
   return { job, reused: false };
@@ -1997,6 +2263,9 @@ app.get('/health', (req, res) => {
     database_configuration_ready: NFTALT_DATABASE_MATCH,
     expected_database_project: NFTALT_PROJECT_REF,
     deposit_watch_seconds: 600,
+    monitoring_revision: 'live-head-v8',
+    deposit_check_interval_seconds: DEPOSIT_WATCH_CHECK_INTERVAL_MS / 1000,
+    deposit_first_check_delay_seconds: DEPOSIT_WATCH_FIRST_CHECK_DELAY_MS / 1000,
     timestamp: new Date().toISOString(),
     uptime: process.uptime(),
     encryption: ENCRYPTION_KEY ? 'AES-256-GCM' : 'NONE'
@@ -2083,6 +2352,7 @@ app.post('/public/deposit/generate', async (req, res) => {
     const result = await generateWalletSingleFlight(user_id, network);
     const { data: watch, error: watchError } = await supabase.rpc('nftalt_activate_deposit_watch', { p_user_id: user_id, p_network: network });
     if (watchError) throw watchError;
+    registerActiveDepositWatch(user_id, network, watch.watch_until, true);
     const walletMs = Number(process.hrtime.bigint() - walletStarted) / 1e6;
 
     const syncStarted = process.hrtime.bigint();
@@ -2115,6 +2385,9 @@ app.post('/public/deposit/generate', async (req, res) => {
       min_deposit: Number(req.pixelState?.config?.min_deposit || MIN_DEPOSIT),
       watch_until: watch.watch_until,
       watch_seconds: watch.watch_seconds,
+      check_interval_seconds: DEPOSIT_WATCH_CHECK_INTERVAL_MS / 1000,
+      first_check_at: new Date(activeDepositWatches.get(depositCheckKey(user_id, network)).nextCheckAt).toISOString(),
+      next_check_at: new Date(activeDepositWatches.get(depositCheckKey(user_id, network)).nextCheckAt).toISOString(),
       timing_ms: Math.round(totalMs)
     });
   } catch (error) {
@@ -2166,6 +2439,13 @@ app.post('/public/deposit/check', userDepositCheckRequestMiddleware, async (req,
     if (asyncMode) {
       if (!network) {
         return res.status(400).json({ success: false, error: 'Network is required' });
+      }
+      const watch = await resolveActiveDepositWatch(user_id, network);
+      if (!watch) return res.json(publicDepositWatchState(user_id, network));
+      if (watch && Date.now() < watch.nextCheckAt) {
+        const current = depositCheckJobs.get(activeDepositCheckJobByUser.get(depositCheckKey(user_id, network)));
+        if (current) return res.json(publicDepositCheckJob(current, true));
+        return res.json({ success: true, job_status: 'waiting', checking: false, next_check_at: new Date(watch.nextCheckAt).toISOString(), check_interval_seconds: DEPOSIT_WATCH_CHECK_INTERVAL_MS / 1000 });
       }
       const { job, reused } = startOrReuseDepositCheckJob(user_id, network);
       runInBackground('public_deposit_check_started', () => safeSystemLog('public_deposit_check_started', `User started deposit check for ${user_id}`, {
@@ -2220,6 +2500,13 @@ app.post('/public/deposit/check/status', async (req, res) => {
     const bearerUser = await getUserFromBearerToken(req);
     if (!bearerUser?.id) {
       return res.status(401).json({ success: false, error: 'Auth required' });
+    }
+
+    const network = String(readParam(req, 'network', '') || '').trim().toLowerCase();
+    if (!readParam(req, 'job_id') && allowedNetworks.includes(network)) {
+      await resolveActiveDepositWatch(bearerUser.id, network);
+      res.set('Cache-Control', 'private, no-store');
+      return res.json(publicDepositWatchState(bearerUser.id, network));
     }
 
     cleanupDepositCheckJobs();
@@ -2420,7 +2707,8 @@ const server = app.listen(PORT, '0.0.0.0', () => {
   console.log(`✅ ALCHEMY ETH RPC: ${ALCHEMY_ETH_RPC_URL ? 'CONFIGURED' : 'MISSING'}`);
   console.log(`✅ ALCHEMY BSC RPC: ${ALCHEMY_BSC_RPC_URL ? 'CONFIGURED' : 'MISSING'}`);
   console.log(`✅ BEP20 USER HISTORY: ALCHEMY-ONLY, NEWEST-FIRST, UP TO ${ALCHEMY_BSC_INITIAL_LOOKBACK_BLOCKS} BLOCKS`);
-  console.log(`✅ DEPOSIT CHECK JOBS: BACKGROUND, ${DEPOSIT_CHECK_JOB_CONCURRENCY} CONCURRENT, SINGLE-FLIGHT PER USER`);
+  console.log(`✅ DEPOSIT CHECK JOBS: BACKGROUND, ${DEPOSIT_CHECK_JOB_CONCURRENCY} CONCURRENT, SINGLE-FLIGHT PER USER/NETWORK`);
+  console.log('✅ ACTIVE WATCH: FIRST CHECK AFTER 60s, THEN EVERY 90s, UP TO SIX CHECKS IN TEN MINUTES');
   console.log(`✅ ALCHEMY LOG GATE: ONE REQUEST EVERY ${ALCHEMY_LOG_REQUEST_MIN_INTERVAL_MS} ms, AUTOMATIC 429 PAUSE`);
   console.log(`✅ BEP20 (USDT & USDC): Checking every ${BEP20_CHECK_INTERVAL} ms`);
   console.log(`✅ ERC20 (USDT & USDC): Checking every ${ERC20_CHECK_INTERVAL} ms`);
@@ -2445,14 +2733,30 @@ async function pollDepositWatches() {
   try {
     const { data, error } = await supabase.rpc('nftalt_take_deposit_watches');
     if (error) throw error;
-    for (const watch of data || []) startOrReuseDepositCheckJob(watch.user_id, watch.network);
+    for (const watch of data || []) registerActiveDepositWatch(watch.user_id, watch.network, watch.watch_until);
+    const now = Date.now();
+    for (const [key, watch] of activeDepositWatches) {
+      if (watch.until <= now) {
+        activeDepositWatches.delete(key);
+        continue;
+      }
+      if (watch.nextCheckAt > now) continue;
+      const { job } = startOrReuseDepositCheckJob(watch.userId, watch.network);
+      watch.nextCheckAt = nextScheduledWatchCheck(watch, now);
+    }
+    for (const [key, cursor] of evmLiveScanCursors) {
+      if (!activeDepositWatches.has(key) && now - cursor.usedAt > DEPOSIT_CHECK_JOB_TTL_MS) evmLiveScanCursors.delete(key);
+    }
+    for (const [key, watch] of completedDepositWatches) {
+      if (watch.until <= now) completedDepositWatches.delete(key);
+    }
   } catch (error) {
     console.error('Deposit watch polling failed:', error.message);
   } finally {
     isPollingDepositWatches = false;
   }
 }
-setInterval(pollDepositWatches, 30000);
+setInterval(pollDepositWatches, Math.min(5000, DEPOSIT_WATCH_CHECK_INTERVAL_MS));
 pollDepositWatches();
 
 setInterval(async () => {
