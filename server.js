@@ -263,8 +263,8 @@ const DEPOSIT_CHECK_RESULT_REUSE_MS = boundedEnvInteger('DEPOSIT_CHECK_RESULT_RE
 const DEPOSIT_CHECK_JOB_CONCURRENCY = boundedEnvInteger('DEPOSIT_CHECK_JOB_CONCURRENCY', 2, 1, 10);
 const DEPOSIT_WATCH_CHECK_INTERVAL_MS = 90000;
 const DEPOSIT_WATCH_FIRST_CHECK_DELAY_MS = 60000;
-const DEPOSIT_HISTORY_SLICE_BLOCKS = boundedEnvInteger('DEPOSIT_HISTORY_SLICE_BLOCKS', 50, 10, 200);
-const ALCHEMY_BSC_WATCH_LOOKBACK_BLOCKS = boundedEnvInteger('ALCHEMY_BSC_WATCH_LOOKBACK_BLOCKS', 120, 20, 600);
+const DEPOSIT_HISTORY_SLICE_BLOCKS = boundedEnvInteger('DEPOSIT_HISTORY_SLICE_BLOCKS', 200, 10, 200);
+const ALCHEMY_BSC_WATCH_LOOKBACK_BLOCKS = boundedEnvInteger('ALCHEMY_BSC_WATCH_LOOKBACK_BLOCKS', 600, 120, 1200);
 const ALCHEMY_ETH_WATCH_LOOKBACK_BLOCKS = boundedEnvInteger('ALCHEMY_ETH_WATCH_LOOKBACK_BLOCKS', 24, 12, 300);
 
 // ========== HELPERS ==========
@@ -1944,11 +1944,12 @@ function scheduleDepositHistoryRecovery(userId, network, chainKey, addresses, fr
   if (!watch || watch.until <= Date.now()) return;
   let recovery = depositHistoryRecoveries.get(key);
   if (!recovery) {
-    recovery = { key, userId, network, chainKey, addresses, fromBlock, nextToBlock: toBlock, retryAt: 0 };
+    recovery = { key, userId, network, chainKey, addresses, fromBlock, nextToBlock: toBlock, retryAt: 0, pending: true };
     depositHistoryRecoveries.set(key, recovery);
   } else {
     recovery.fromBlock = Math.min(recovery.fromBlock, fromBlock);
     recovery.nextToBlock = Math.max(recovery.nextToBlock, toBlock);
+    recovery.pending = true;
   }
   // Let the live job finish before the history worker asks for a request slot.
   setTimeout(drainDepositHistoryRecovery, 0);
@@ -1997,6 +1998,11 @@ async function checkUserEVMLiveDeposits(userId, chainKey, options = {}) {
       } else if (cursor.block + 1 < fromBlock) {
         // A long outage may exceed the live tail; recover that gap separately.
         scheduleDepositHistoryRecovery(userId, network, chainKey, [address], cursor.block + 1, fromBlock - 1);
+      } else if (depositHistoryRecoveries.has(key)) {
+        // One bounded history slice belongs to each scheduled live check.
+        // It never starts extra checking cycles between the six scheduled ones.
+        depositHistoryRecoveries.get(key).pending = true;
+        setTimeout(drainDepositHistoryRecovery, 0);
       }
     }
     return summary;
@@ -2019,6 +2025,8 @@ async function drainDepositHistoryRecovery() {
         continue;
       }
       if (recovery.retryAt > Date.now()) continue;
+      if (!recovery.pending) continue;
+      recovery.pending = false;
       const fromBlock = Math.max(recovery.fromBlock, recovery.nextToBlock - DEPOSIT_HISTORY_SLICE_BLOCKS + 1);
       const summary = { checked: 0, deposits: 0, duplicates: 0, errors: 0 };
       try {
@@ -2057,7 +2065,7 @@ async function drainDepositHistoryRecovery() {
     }
   } finally {
     runningDepositHistoryRecovery = false;
-    if (depositHistoryRecoveries.size) setTimeout(drainDepositHistoryRecovery, 1000);
+    if ([...depositHistoryRecoveries.values()].some(recovery => recovery.pending)) setTimeout(drainDepositHistoryRecovery, 1000);
   }
 }
 
@@ -2263,9 +2271,11 @@ app.get('/health', (req, res) => {
     database_configuration_ready: NFTALT_DATABASE_MATCH,
     expected_database_project: NFTALT_PROJECT_REF,
     deposit_watch_seconds: 600,
-    monitoring_revision: 'live-head-v8',
+    monitoring_revision: 'live-head-v8-6checks',
     deposit_check_interval_seconds: DEPOSIT_WATCH_CHECK_INTERVAL_MS / 1000,
     deposit_first_check_delay_seconds: DEPOSIT_WATCH_FIRST_CHECK_DELAY_MS / 1000,
+    history_recovery_mode: 'one_slice_per_scheduled_check',
+    bep20_live_lookback_blocks: ALCHEMY_BSC_WATCH_LOOKBACK_BLOCKS,
     timestamp: new Date().toISOString(),
     uptime: process.uptime(),
     encryption: ENCRYPTION_KEY ? 'AES-256-GCM' : 'NONE'
@@ -2738,6 +2748,7 @@ async function pollDepositWatches() {
     for (const [key, watch] of activeDepositWatches) {
       if (watch.until <= now) {
         activeDepositWatches.delete(key);
+        depositHistoryRecoveries.delete(key);
         continue;
       }
       if (watch.nextCheckAt > now) continue;

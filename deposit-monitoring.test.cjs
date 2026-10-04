@@ -76,7 +76,7 @@ test('head checks use a short confirmed range and overlap without crediting dupl
   const first=await f.hooks.checkUserEVMLiveDeposits(USER,'bsc',{network:NETWORK});
   latest+=60;
   const second=await f.hooks.checkUserEVMLiveDeposits(USER,'bsc',{network:NETWORK});
-  assert.equal(scans[0].fromBlock,9881);assert.equal(scans[0].toBlock,10000);
+  assert.equal(scans[0].fromBlock,9401);assert.equal(scans[0].toBlock,10000);
   assert.equal(scans[1].fromBlock,9981);assert.equal(scans[1].toBlock,10060);
   assert.equal(first.deposits,1);assert.equal(second.deposits,0);assert.equal(second.duplicates,1);
   assert.equal(credits[0][5],1);assert.equal(credits[0][6],2);
@@ -130,7 +130,7 @@ test('provider adapter still uses at most ten blocks per RPC and excludes unconf
   f.context.fakeRPC=async(c,method,params)=>{if(method==='eth_blockNumber')return '0x2713';if(method==='eth_getLogs'){ranges.push(params[0]);return [];}throw Error('Unexpected RPC');};
   vm.runInContext('alchemyRpc=fakeRPC;sleep=async()=>{}',f.context);
   await f.hooks.checkUserEVMLiveDeposits(USER,'bsc',{network:NETWORK});
-  assert.equal(ranges.length,12);
+  assert.equal(ranges.length,60);
   for(const r of ranges){assert.ok(Number(BigInt(r.toBlock))-Number(BigInt(r.fromBlock))+1<=10);assert.ok(Number(BigInt(r.toBlock))<=10000);}
 });
 
