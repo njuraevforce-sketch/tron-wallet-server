@@ -3,7 +3,7 @@ const { createClient } = require('@supabase/supabase-js');
 const crypto = require('crypto');
 const WebSocket = require('ws'); // ИСПРАВЛЕНИЕ: Добавлен пакет ws
 
-const SUPABASE_URL = process.env.SUPABASE_URL || 'https://dsfzbhrzritqxoupihxa.supabase.co';
+const SUPABASE_URL = process.env.SUPABASE_URL || 'https://fctwivbwjoslkejtjxhe.supabase.co';
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const ENCRYPTION_KEY = process.env.ENCRYPTION_KEY;
 
