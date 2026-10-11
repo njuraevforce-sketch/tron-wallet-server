@@ -243,7 +243,7 @@ const ALCHEMY_ETH_CONFIRMATIONS = boundedEnvInteger('ALCHEMY_ETH_CONFIRMATIONS',
 // Railway restarts must not hide deposits that are already more than 1,200
 // BSC blocks old. Recovery is processed in bounded chunks below, so this
 // larger safety window does not create one oversized provider request burst.
-const ALCHEMY_BSC_INITIAL_LOOKBACK_BLOCKS = boundedEnvInteger('ALCHEMY_BSC_INITIAL_LOOKBACK_BLOCKS', 10000, 10, 100000);
+const ALCHEMY_BSC_INITIAL_LOOKBACK_BLOCKS = boundedEnvInteger('ALCHEMY_BSC_INITIAL_LOOKBACK_BLOCKS', 20000, 10, 100000);
 const ALCHEMY_ETH_INITIAL_LOOKBACK_BLOCKS = boundedEnvInteger('ALCHEMY_ETH_INITIAL_LOOKBACK_BLOCKS', 720, 10, 100000);
 const ALCHEMY_BSC_MANUAL_LOOKBACK_BLOCKS = boundedEnvInteger('ALCHEMY_BSC_MANUAL_LOOKBACK_BLOCKS', 600, 10, 100000);
 const ALCHEMY_ETH_MANUAL_LOOKBACK_BLOCKS = boundedEnvInteger('ALCHEMY_ETH_MANUAL_LOOKBACK_BLOCKS', 300, 10, 100000);
@@ -265,6 +265,9 @@ const DEPOSIT_WATCH_CHECK_INTERVAL_MS = 90000;
 const DEPOSIT_WATCH_FIRST_CHECK_DELAY_MS = 60000;
 const DEPOSIT_HISTORY_SLICE_BLOCKS = boundedEnvInteger('DEPOSIT_HISTORY_SLICE_BLOCKS', 200, 10, 200);
 const ALCHEMY_BSC_WATCH_LOOKBACK_BLOCKS = boundedEnvInteger('ALCHEMY_BSC_WATCH_LOOKBACK_BLOCKS', 600, 120, 1200);
+// The fast tail stays small. An older, already-confirmed transfer must also be
+// covered even when an installation still has the former 10,000-block value.
+const ALCHEMY_BSC_WATCH_HISTORY_LOOKBACK_BLOCKS = boundedEnvInteger('ALCHEMY_BSC_WATCH_HISTORY_LOOKBACK_BLOCKS', Math.max(20000, ALCHEMY_BSC_INITIAL_LOOKBACK_BLOCKS), 10, 100000);
 const ALCHEMY_ETH_WATCH_LOOKBACK_BLOCKS = boundedEnvInteger('ALCHEMY_ETH_WATCH_LOOKBACK_BLOCKS', 24, 12, 300);
 
 // ========== HELPERS ==========
@@ -1032,11 +1035,14 @@ async function scanAlchemyLogTransfers(chainKey, addresses, mode = 'manual', opt
   const concurrency = Math.max(1, Math.min(requestedConcurrency, ALCHEMY_BSC_USER_SCAN_CONCURRENCY));
   let nextRequestIndex = 0;
   let completedRequests = 0;
+  let scanError = null;
 
   async function logWorker() {
     while (nextRequestIndex < logRequests.length) {
+      if (scanError) return;
       if (mode === 'background') await waitForLiveDepositChecks();
       if (typeof options.beforeRequest === 'function') await options.beforeRequest();
+      if (scanError) return;
       const requestIndex = nextRequestIndex++;
       const { fromBlock, toBlock, addressChunk } = logRequests[requestIndex];
       const destinationTopics = addressChunk.map(evmAddressTopic);
@@ -1071,8 +1077,13 @@ async function scanAlchemyLogTransfers(chainKey, addresses, mode = 'manual', opt
   }
 
   await Promise.all(
-    Array.from({ length: Math.min(concurrency, Math.max(1, logRequests.length)) }, () => logWorker())
+    Array.from({ length: Math.min(concurrency, Math.max(1, logRequests.length)) }, () =>
+      logWorker().catch(error => { if (!scanError) scanError = error; })
+    )
   );
+  // Keep this scan owned until all in-flight workers settle. A failed request
+  // must not leave another worker scanning behind the next recovery attempt.
+  if (scanError) throw scanError;
 
   const destinationSet = new Set(normalizedAddresses);
   const uniqueLogs = new Map();
@@ -1645,9 +1656,9 @@ async function checkUserBEP20Deposits(userId, options = {}) {
     const latestConfirmedBlock = latestBlock - chain.confirmations;
     if (latestConfirmedBlock < 0 || !addresses.length) return summary;
 
-    // Search the existing 10,000-block recovery window newest-first. The first
+    // Search the configured history recovery window newest-first. The first
     // 600-block band is the fast path; older bands are the extended scan.
-    const historyFromBlock = Math.max(0, latestConfirmedBlock - chain.initialLookback + 1);
+    const historyFromBlock = Math.max(0, latestConfirmedBlock - ALCHEMY_BSC_WATCH_HISTORY_LOOKBACK_BLOCKS + 1);
     const blocksPerAddress = latestConfirmedBlock - historyFromBlock + 1;
     const totalBlocks = blocksPerAddress * addresses.length;
     const bandSize = Math.max(chain.logBlockRange, chain.manualLookback);
@@ -1829,6 +1840,8 @@ const completedDepositWatches = new Map();
 const evmLiveScanCursors = new Map();
 const depositHistoryRecoveries = new Map();
 let runningDepositHistoryRecovery = false;
+let depositHistoryRecoveryTimer = null;
+let depositHistoryRecoveryTimerAt = 0;
 
 function depositCheckKey(userId, network) {
   return `${userId}:${network}`;
@@ -1937,6 +1950,19 @@ function publicDepositWatchState(userId, network) {
     check_interval_seconds: DEPOSIT_WATCH_CHECK_INTERVAL_MS / 1000, next_check_at: new Date(watch.nextCheckAt).toISOString() };
 }
 
+function queueDepositHistoryRecovery(delayMs = 0) {
+  if (runningDepositHistoryRecovery) return;
+  const nextAt = Date.now() + Math.max(0, delayMs);
+  if (depositHistoryRecoveryTimer !== null && depositHistoryRecoveryTimerAt <= nextAt) return;
+  if (depositHistoryRecoveryTimer !== null) clearTimeout(depositHistoryRecoveryTimer);
+  depositHistoryRecoveryTimerAt = nextAt;
+  depositHistoryRecoveryTimer = setTimeout(() => {
+    depositHistoryRecoveryTimer = null;
+    depositHistoryRecoveryTimerAt = 0;
+    drainDepositHistoryRecovery().catch(error => console.error('Deposit history recovery failed:', error.message));
+  }, Math.max(0, nextAt - Date.now()));
+}
+
 function scheduleDepositHistoryRecovery(userId, network, chainKey, addresses, fromBlock, toBlock) {
   if (fromBlock > toBlock) return;
   const key = depositCheckKey(userId, network);
@@ -1944,15 +1970,15 @@ function scheduleDepositHistoryRecovery(userId, network, chainKey, addresses, fr
   if (!watch || watch.until <= Date.now()) return;
   let recovery = depositHistoryRecoveries.get(key);
   if (!recovery) {
-    recovery = { key, userId, network, chainKey, addresses, fromBlock, nextToBlock: toBlock, retryAt: 0, pending: true };
+    recovery = { key, userId, network, chainKey, addresses, fromBlock, nextToBlock: toBlock, retryAt: 0 };
     depositHistoryRecoveries.set(key, recovery);
+    console.log(`🔎 Deposit history recovery scheduled: ${network}, user ${userId}, blocks ${fromBlock}-${toBlock}`);
   } else {
     recovery.fromBlock = Math.min(recovery.fromBlock, fromBlock);
     recovery.nextToBlock = Math.max(recovery.nextToBlock, toBlock);
-    recovery.pending = true;
   }
   // Let the live job finish before the history worker asks for a request slot.
-  setTimeout(drainDepositHistoryRecovery, 0);
+  queueDepositHistoryRecovery();
 }
 
 async function checkUserEVMLiveDeposits(userId, chainKey, options = {}) {
@@ -1992,17 +2018,17 @@ async function checkUserEVMLiveDeposits(userId, chainKey, options = {}) {
     summary.scanned_blocks = blocks;
     summary.total_blocks = blocks;
     if (!summary.deposits) {
-      const historyFrom = Math.max(0, head - chain.initialLookback + 1);
+      const historyLookback = chainKey === 'bsc' ? ALCHEMY_BSC_WATCH_HISTORY_LOOKBACK_BLOCKS : chain.initialLookback;
+      const historyFrom = Math.max(0, head - historyLookback + 1);
       if (!cursor || cursor.block > head) {
         scheduleDepositHistoryRecovery(userId, network, chainKey, [address], historyFrom, fromBlock - 1);
       } else if (cursor.block + 1 < fromBlock) {
         // A long outage may exceed the live tail; recover that gap separately.
         scheduleDepositHistoryRecovery(userId, network, chainKey, [address], cursor.block + 1, fromBlock - 1);
       } else if (depositHistoryRecoveries.has(key)) {
-        // One bounded history slice belongs to each scheduled live check.
-        // It never starts extra checking cycles between the six scheduled ones.
-        depositHistoryRecoveries.get(key).pending = true;
-        setTimeout(drainDepositHistoryRecovery, 0);
+        // Resume the bounded history worker independently of the six live
+        // checks. Every request still yields to live jobs and their RPC gate.
+        queueDepositHistoryRecovery();
       }
     }
     return summary;
@@ -2025,13 +2051,11 @@ async function drainDepositHistoryRecovery() {
         continue;
       }
       if (recovery.retryAt > Date.now()) continue;
-      if (!recovery.pending) continue;
-      recovery.pending = false;
       const fromBlock = Math.max(recovery.fromBlock, recovery.nextToBlock - DEPOSIT_HISTORY_SLICE_BLOCKS + 1);
       const summary = { checked: 0, deposits: 0, duplicates: 0, errors: 0 };
       try {
         const scan = await scanAlchemyLogTransfers(recovery.chainKey, recovery.addresses, 'manual', {
-          fromBlock, toBlock: recovery.nextToBlock, network: recovery.network, concurrency: 1,
+          fromBlock, toBlock: recovery.nextToBlock, network: recovery.network, concurrency: 2,
           beforeRequest: async () => {
             await waitForLiveDepositChecks();
             const currentWatch = activeDepositWatches.get(key);
@@ -2041,6 +2065,7 @@ async function drainDepositHistoryRecovery() {
         await creditLiveScanTransfers(recovery.userId, scan.transactions, summary);
         if (summary.errors) throw new Error('DEPOSIT_PROCESSING_FAILED');
         recovery.nextToBlock = fromBlock - 1;
+        recovery.retryAt = 0;
         if (summary.deposits) {
           const job = depositCheckJobs.get(activeDepositCheckJobByUser.get(key));
           if (job) {
@@ -2052,6 +2077,9 @@ async function drainDepositHistoryRecovery() {
           await finishActiveDepositWatch(recovery.userId, recovery.network);
           depositHistoryRecoveries.delete(key);
           console.log(`✅ Deposit history recovery credited ${summary.deposits} transfer(s) on ${recovery.network}`);
+        } else if (recovery.nextToBlock < recovery.fromBlock) {
+          depositHistoryRecoveries.delete(key);
+          console.log(`✅ Deposit history recovery finished: ${recovery.network}, user ${recovery.userId}, no new transfers`);
         }
       } catch (error) {
         if (error.message === 'DEPOSIT_WATCH_ENDED') {
@@ -2065,7 +2093,16 @@ async function drainDepositHistoryRecovery() {
     }
   } finally {
     runningDepositHistoryRecovery = false;
-    if ([...depositHistoryRecoveries.values()].some(recovery => recovery.pending)) setTimeout(drainDepositHistoryRecovery, 1000);
+    let nextDelay = Infinity;
+    for (const [key, recovery] of depositHistoryRecoveries) {
+      const watch = activeDepositWatches.get(key);
+      if (!watch || watch.until <= Date.now() || recovery.nextToBlock < recovery.fromBlock) {
+        depositHistoryRecoveries.delete(key);
+        continue;
+      }
+      nextDelay = Math.min(nextDelay, Math.max(1000, recovery.retryAt - Date.now()));
+    }
+    if (Number.isFinite(nextDelay)) queueDepositHistoryRecovery(nextDelay);
   }
 }
 
@@ -2266,6 +2303,7 @@ app.get('/health', (req, res) => {
     status: '✅ HEALTHY',
     service: 'NFTALT Deposit Processor',
     contract_version: 3,
+    scanner_revision: 'history-continuous-20261011',
     database_project: new URL(SUPABASE_URL).hostname.split('.')[0],
     profile_table: 'nftalt_profiles',
     database_configuration_ready: NFTALT_DATABASE_MATCH,
@@ -2274,8 +2312,9 @@ app.get('/health', (req, res) => {
     monitoring_revision: 'live-head-v8-6checks',
     deposit_check_interval_seconds: DEPOSIT_WATCH_CHECK_INTERVAL_MS / 1000,
     deposit_first_check_delay_seconds: DEPOSIT_WATCH_FIRST_CHECK_DELAY_MS / 1000,
-    history_recovery_mode: 'one_slice_per_scheduled_check',
+    history_recovery_mode: 'continuous_slices_live_priority',
     bep20_live_lookback_blocks: ALCHEMY_BSC_WATCH_LOOKBACK_BLOCKS,
+    bep20_history_lookback_blocks: ALCHEMY_BSC_WATCH_HISTORY_LOOKBACK_BLOCKS,
     timestamp: new Date().toISOString(),
     uptime: process.uptime(),
     encryption: ENCRYPTION_KEY ? 'AES-256-GCM' : 'NONE'
