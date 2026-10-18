@@ -86,8 +86,9 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
 app.use(express.json({ limit: '1mb' }));
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
-  res.header('Access-Control-Allow-Headers', '*');
-  res.header('Access-Control-Allow-Methods', '*');
+  // Authorization is not covered by the CORS wildcard in browsers/webviews.
+  res.header('Access-Control-Allow-Headers', 'Authorization, Content-Type, X-API-Key');
+  res.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
   res.header('Access-Control-Expose-Headers', 'Server-Timing, X-Response-Time');
   if (req.method === 'OPTIONS') return res.sendStatus(204);
   next();
@@ -1042,7 +1043,8 @@ async function scanAlchemyLogTransfers(chainKey, addresses, mode = 'manual', opt
       if (scanError) return;
       if (mode === 'background') await waitForLiveDepositChecks();
       if (typeof options.beforeRequest === 'function') await options.beforeRequest();
-      if (scanError) return;
+      // Another worker may take the final request while this worker is waiting.
+      if (scanError || nextRequestIndex >= logRequests.length) return;
       const requestIndex = nextRequestIndex++;
       const { fromBlock, toBlock, addressChunk } = logRequests[requestIndex];
       const destinationTopics = addressChunk.map(evmAddressTopic);

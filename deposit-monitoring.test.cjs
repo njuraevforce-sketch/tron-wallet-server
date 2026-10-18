@@ -12,23 +12,93 @@ const flush = () => new Promise(resolve => setImmediate(resolve));
 async function fixture() {
   let now = BASE;
   class Clock extends Date { constructor(...args) { super(...(args.length ? args : [now])); } static now() { return now; } }
-  const routes = new Map(), rpcCalls = [], timers = [];
+  const routes = new Map(), rpcCalls = [], timers = [], middlewares = [];
   const wallet = { user_id: USER, usdt_bep20_address: ADDRESS, usdc_bep20_address: ADDRESS, usdt_erc20_address: ADDRESS, usdc_erc20_address: ADDRESS, usdt_trc20_address: 'test-only' };
   const client = {
     rpc: async (name, args) => { rpcCalls.push({ name, args }); return { data: [], error: null }; },
     from: () => { const q = { select: () => q, eq: () => q, maybeSingle: async () => ({ data: wallet, error: null }), insert: async () => ({ error: null }) }; return q; }
   };
-  const app = { set() {}, use() {}, get(path,...fns) { routes.set('GET ' + path, fns); }, post(path,...fns) { routes.set('POST ' + path, fns); }, listen() { return { close() {} }; } };
+  const app = { set() {}, use(fn) { middlewares.push(fn); }, get(path,...fns) { routes.set('GET ' + path, fns); }, post(path,...fns) { routes.set('POST ' + path, fns); }, listen() { return { close() {} }; } };
   const express = () => app; express.json = () => (req,res,next) => next();
   const context = vm.createContext({ URL, Date: Clock, Map, Set, Buffer, Promise, AbortController, Intl,
     process: { env: { SUPABASE_URL: 'https://fctwivbwjoslkejtjxhe.supabase.co', SUPABASE_SERVICE_ROLE_KEY: 'test-only', ENCRYPTION_KEY: 'x'.repeat(32), API_SECRET_KEY: 'y'.repeat(32) }, on() {}, hrtime: process.hrtime, uptime: () => 1, exit() { throw Error('Unexpected exit'); } },
     console: { log() {}, warn() {}, error() {} }, setInterval() {}, setTimeout(fn,ms) { timers.push({ fn, ms }); return timers.length; }, clearTimeout() {},
     require(name) { if (name === 'express') return express; if (name === '@supabase/supabase-js') return { createClient: () => client }; if (name === 'ethers') return { formatUnits: (value, decimals) => String(Number(value) / 10 ** decimals) }; if (name === 'ws') return function() {}; return require(name); }
   });
-  vm.runInContext(source + '\nthis.hooks={registerActiveDepositWatch,pollDepositWatches,nextScheduledWatchCheck,startOrReuseDepositCheckJob,checkUserEVMLiveDeposits,drainDepositHistoryRecovery,publicDepositCheckJob,recordDepositWatchDetection,publicDepositWatchState,activeDepositWatches,depositCheckJobs,evmLiveScanCursors,depositHistoryRecoveries};', context);
+  vm.runInContext(source + '\nthis.hooks={registerActiveDepositWatch,pollDepositWatches,nextScheduledWatchCheck,startOrReuseDepositCheckJob,checkUserEVMLiveDeposits,scanAlchemyLogTransfers,drainDepositHistoryRecovery,publicDepositCheckJob,recordDepositWatchDetection,publicDepositWatchState,activeDepositWatches,depositCheckJobs,evmLiveScanCursors,depositHistoryRecoveries};', context);
   await flush();
-  return { context, hooks: context.hooks, routes, rpcCalls, timers, at(seconds) { now = BASE + seconds * 1000; }, deadline: new Date(BASE + 600000).toISOString() };
+  return { context, hooks: context.hooks, routes, rpcCalls, timers, middlewares, at(seconds) { now = BASE + seconds * 1000; }, deadline: new Date(BASE + 600000).toISOString() };
 }
+
+async function request(f, method, path, headers = {}) {
+  const req = { method, path, headers, ip: 'test', body: {}, query: {} };
+  const res = {
+    statusCode: 200, headers: new Map(), body: null,
+    header(name, value) { this.headers.set(name.toLowerCase(), value); return this; },
+    set(name, value) { return this.header(name, value); },
+    status(value) { this.statusCode = value; return this; },
+    sendStatus(value) { return this.status(value); },
+    json(value) { this.body = value; return this; }
+  };
+  for (const handler of [...f.middlewares, ...(f.routes.get(method + ' ' + path) || [])]) {
+    let continued = false;
+    await handler(req, res, () => { continued = true; });
+    if (!continued) break;
+  }
+  return res;
+}
+
+test('browser preflight explicitly permits bearer auth and JSON without touching the database', async () => {
+  const f = await fixture();
+  const startupRpcCalls = f.rpcCalls.length;
+  for (const origin of ['https://nftalt.com', 'https://www.nftalt.com', 'null']) {
+    const res = await request(f, 'OPTIONS', '/public/deposit/generate', {
+      origin, 'access-control-request-method': 'POST',
+      'access-control-request-headers': 'authorization,content-type'
+    });
+    assert.equal(res.statusCode, 204);
+    assert.equal(res.headers.get('access-control-allow-origin'), '*');
+    const allowed = res.headers.get('access-control-allow-headers').toLowerCase().split(/\s*,\s*/);
+    for (const name of ['authorization', 'content-type', 'x-api-key']) assert.ok(allowed.includes(name), name);
+    assert.ok(res.headers.get('access-control-allow-methods').split(/\s*,\s*/).includes('POST'));
+  }
+  assert.equal(f.rpcCalls.length, startupRpcCalls);
+});
+
+test('CORS keeps authentication and the existing IP limit enforced', async () => {
+  const f = await fixture();
+  const startupRpcCalls = f.rpcCalls.length;
+  for (let i = 0; i < 60; i++) {
+    const res = await request(f, 'POST', '/public/deposit/generate', { origin: 'https://nftalt.com' });
+    assert.equal(res.statusCode, 401);
+    assert.equal(res.body.error, 'Auth required');
+    assert.ok(res.headers.get('access-control-allow-headers').includes('Authorization'));
+  }
+  assert.equal((await request(f, 'POST', '/public/deposit/generate')).statusCode, 429);
+  assert.equal((await request(f, 'OPTIONS', '/public/deposit/generate')).statusCode, 204);
+  assert.equal(f.rpcCalls.length, startupRpcCalls);
+});
+
+test('parallel log workers reserve the last request safely after yielding to live checks', async () => {
+  for (const mode of ['manual', 'background']) {
+    const f = await fixture(), ranges = [], progress = [];
+    f.context.fakeRPC = async (chain, method, params) => {
+      assert.equal(method, 'eth_getLogs');
+      ranges.push([Number(BigInt(params[0].fromBlock)), Number(BigInt(params[0].toBlock))]);
+      return [];
+    };
+    vm.runInContext('alchemyRpc=fakeRPC;sleep=async()=>{}', f.context);
+    const result = await f.hooks.scanAlchemyLogTransfers('bsc', [ADDRESS], mode, {
+      fromBlock: 100, toBlock: 129, network: NETWORK, concurrency: 2,
+      beforeRequest: async () => {}, onProgress: value => progress.push(value)
+    });
+    assert.deepEqual(ranges, [[100,109], [110,119], [120,129]]);
+    assert.equal(progress.length, 3);
+    assert.equal(progress.at(-1).completedRequests, 3);
+    assert.equal(progress.at(-1).totalRequests, 3);
+    assert.equal(result.transactions.length, 0);
+  }
+});
 
 test('ten-minute watch starts exactly six jobs at 60,150,240,330,420,510 seconds', async () => {
   const f = await fixture(), starts = [];
@@ -99,7 +169,7 @@ test('a slow history slice does not prevent a newer transfer being credited', as
   const f=await fixture();let latest=10003,release,oldStarted=false;
   f.context.fakeRPC=async()=>latest;
   f.context.fakeScan=async(c,a,m,o)=>{
-    if(o.concurrency===1){oldStarted=true;return new Promise(resolve=>{release=()=>resolve({transactions:[]});});}
+    if(o.toBlock<9401){oldStarted=true;return new Promise(resolve=>{release=()=>resolve({transactions:[]});});}
     return {transactions:latest>10003?[{amount:30,transaction_id:'new-transfer',network:NETWORK,to:ADDRESS,confirmed:true,event_index:0,token:'USDT'}]:[]};
   };
   f.context.fakeCredit=async()=>({success:true});
