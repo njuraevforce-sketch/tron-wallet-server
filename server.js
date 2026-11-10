@@ -693,7 +693,7 @@ async function findLegacyEventZeroDeposit(userId, amount, txid, network, address
   return depositIdentityMatches(data, userId, amount, network, address) ? data : null;
 }
 
-async function processDeposit(userId, amount, txid, network, address = null, confirmations = 1, eventIndex = 0) {
+async function processDeposit(userId, amount, txid, network, address = null, confirmations = 1, eventIndex = 0, observation = null) {
   try {
     const normalizedNetwork = String(network || '').trim().toLowerCase();
     const hash = String(txid || '').trim().toLowerCase().replace(/^0x/, '');
@@ -727,7 +727,7 @@ async function processDeposit(userId, amount, txid, network, address = null, con
     // JS read cannot protect against concurrent manual/background checks. The
     // read above exists only for rows created before real logIndex forwarding.
     return await processDepositAtomic(userId, Number(amount), normalizedTxid,
-      normalizedNetwork, address, confirmations, normalizedEventIndex);
+      normalizedNetwork, address, confirmations, normalizedEventIndex, observation);
   } catch (error) {
     console.error('❌ Error in processDeposit:', error.message);
     await safeSystemLog('deposit_processing_error', 'Deposit processing error: ' + error.message, {
@@ -737,8 +737,8 @@ async function processDeposit(userId, amount, txid, network, address = null, con
   }
 }
 
-async function processDepositAtomic(userId, amount, txid, network, address = null, confirmations = 1, eventIndex = 0) {
-  const { data: result, error } = await supabase.rpc('credit_chain_deposit', {
+async function processDepositAtomic(userId, amount, txid, network, address = null, confirmations = 1, eventIndex = 0, observation = null) {
+  const args = {
     p_user_id: userId,
     p_amount: amount,
     p_network: network,
@@ -748,8 +748,27 @@ async function processDepositAtomic(userId, amount, txid, network, address = nul
     // This is not a fabricated count of blockchain confirmations.
     p_confirmations: Math.max(Number(confirmations || 0), 0),
     p_event_index: eventIndex
-  });
+  };
+  let response;
+  if (observation?.from && confirmations > 0) {
+    const timestamp = Number(observation.timestamp);
+    const chainTime = Number.isFinite(timestamp) && timestamp > 0 && timestamp <= 8640000000000000
+      ? new Date(timestamp).toISOString() : null;
+    response = await supabase.rpc('nftalt_credit_observed_deposit', {
+      ...args, p_sender: observation.from, p_chain_at: chainTime
+    });
+    if (response.error?.code === 'PGRST202') {
+      // During a rolling deploy PostgREST may not have the new RPC yet.
+      response = await supabase.rpc('credit_chain_deposit', args);
+    }
+  } else {
+    response = await supabase.rpc('credit_chain_deposit', args);
+  }
+  const { data: result, error } = response;
   if (error) throw error;
+  if (result?.observation_recorded === false) {
+    console.warn('Deposit review metadata was not saved:', txid, eventIndex);
+  }
   if (!result || result.success !== true) throw new Error(result?.error || 'Deposit processing failed');
   const alreadyProcessed = result.already_processed === true || result.duplicate === true;
   if (!alreadyProcessed) {
@@ -959,7 +978,7 @@ async function alchemyBlockTimestamp(chainKey, blockHex) {
   const cacheKey = `${chainKey}:${String(blockHex).toLowerCase()}`;
   if (alchemyBlockTimestampCache.has(cacheKey)) return alchemyBlockTimestampCache.get(cacheKey);
 
-  let timestamp = Date.now();
+  let timestamp = null;
   try {
     const block = await alchemyRpc(chainKey, 'eth_getBlockByNumber', [blockHex, false]);
     const seconds = safeRpcNumber(block?.timestamp, 'block timestamp');
@@ -1224,7 +1243,7 @@ async function getAlchemyERC20AssetTransfers(address, network = '') {
           token: token.symbol,
           confirmed: true,
           network: token.network,
-          timestamp: Date.parse(transfer?.metadata?.blockTimestamp || '') || Date.now(),
+          timestamp: Date.parse(transfer?.metadata?.blockTimestamp || '') || null,
           blockNumber: safeRpcNumber(transfer?.blockNum, 'transfer block number')
         });
       } catch (error) {
@@ -1316,7 +1335,7 @@ async function getTRC20Transactions(address) {
         transactions.push({
           transaction_id: String(tx.transaction_id || tx.hash || ''),
           to: toAddress,
-          from: String(tx.from || '').trim(),
+          from: tx.token_info?.address === USDT_TRON_CONTRACT ? String(tx.from || '').trim() : '',
           amount,
           token: 'USDT',
           confirmed: true,
@@ -1431,7 +1450,8 @@ async function handleCheckEvmDeposits({ chainKey, label, addressFields, filter, 
           tx.network,
           tx.to,
           tx.confirmed ? 1 : 0,
-          tx.event_index
+          tx.event_index,
+          tx
         );
         if (!result.success) throw new Error(result.error || 'Deposit processing failed');
         if (result.already_processed) {
@@ -1540,7 +1560,7 @@ async function handleCheckTRC20Deposits() {
                 continue;
               }
 
-              const result = await processDeposit(wallet.user_id, tx.amount, tx.transaction_id, tx.network, tx.to || address, tx.confirmed ? 1 : 0);
+              const result = await processDeposit(wallet.user_id, tx.amount, tx.transaction_id, tx.network, tx.to || address, tx.confirmed ? 1 : 0, 0, tx);
               if (!result.success) throw new Error(result.error || 'Deposit processing failed');
               if (result.already_processed) { duplicatesSkipped++; continue; }
               if (result.success) {
@@ -1606,7 +1626,7 @@ async function checkUserTRC20Deposits(userId, options = {}) {
 
       for (const tx of transactions) {
         try {
-          const result = await processDeposit(userId, tx.amount, tx.transaction_id, tx.network, tx.to || address, tx.confirmed ? 1 : 0);
+          const result = await processDeposit(userId, tx.amount, tx.transaction_id, tx.network, tx.to || address, tx.confirmed ? 1 : 0, 0, tx);
           if (!result?.success) throw new Error(result?.error || 'Deposit processing failed');
           if (result?.success) {
             if (result.already_processed) summary.duplicates++;
@@ -1711,7 +1731,7 @@ async function checkUserBEP20Deposits(userId, options = {}) {
 
         for (const tx of transactions) {
           try {
-            const result = await processDeposit(userId, tx.amount, tx.transaction_id, tx.network, tx.to || address, tx.confirmed ? 1 : 0, tx.event_index);
+            const result = await processDeposit(userId, tx.amount, tx.transaction_id, tx.network, tx.to || address, tx.confirmed ? 1 : 0, tx.event_index, tx);
             if (!result?.success) throw new Error(result?.error || 'Deposit processing failed');
             if (result.already_processed) {
               summary.duplicates++;
@@ -1785,7 +1805,7 @@ async function checkUserERC20Deposits(userId, options = {}) {
 
       for (const tx of transactions) {
         try {
-          const result = await processDeposit(userId, tx.amount, tx.transaction_id, tx.network, tx.to || address, tx.confirmed ? 1 : 0, tx.event_index);
+          const result = await processDeposit(userId, tx.amount, tx.transaction_id, tx.network, tx.to || address, tx.confirmed ? 1 : 0, tx.event_index, tx);
           if (!result?.success) throw new Error(result?.error || 'Deposit processing failed');
           if (result?.success) {
             if (result.already_processed) summary.duplicates++;
@@ -1891,7 +1911,7 @@ async function creditLiveScanTransfers(userId, transactions, summary) {
   summary.checked += transactions.length;
   for (const tx of transactions) {
     try {
-      const result = await processDeposit(userId, tx.amount, tx.transaction_id, tx.network, tx.to, tx.confirmed ? 1 : 0, tx.event_index);
+      const result = await processDeposit(userId, tx.amount, tx.transaction_id, tx.network, tx.to, tx.confirmed ? 1 : 0, tx.event_index, tx);
       if (!result?.success) throw new Error(result?.error || 'Deposit processing failed');
       if (result.already_processed) summary.duplicates++;
       else {
