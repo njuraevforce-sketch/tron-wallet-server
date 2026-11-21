@@ -504,6 +504,7 @@ function decryptPrivateKey(encryptedText) {
 
 // ========== AUTO-SWEEP LOGIC (BEP20) ==========
 async function sweepDepositBEP20(userId, token, network) {
+  if (process.env.TREASURY_BSC_OWNER === 'worker') return;
   if (!HOT_WALLET_PRIVATE_KEY || !ADMIN_SWEEP_ADDRESS) return;
 
   console.log(`🧹 Starting Auto-Sweep for user ${userId} (${token} on ${network})`);
@@ -2762,6 +2763,16 @@ app.get('/api/check-deposits', requireApiKey, async (req, res) => {
 });
 
 // ========== START SERVER ==========
+if (process.env.TREASURY_MODE && process.env.TREASURY_MODE !== 'off') {
+  try {
+    require('./treasury').startTreasury({
+      db: supabase, env: process.env, decrypt: decryptPrivateKey,
+      urls: { eth: ALCHEMY_ETH_RPC_URL, bsc: ALCHEMY_BSC_RPC_URL }
+    });
+  } catch {
+    console.error('TREASURY_CONFIGURATION_INVALID: check recipients, chain policy and fee limits');
+  }
+}
 const server = app.listen(PORT, '0.0.0.0', () => {
   console.log(`🚀 HTTP SERVER RUNNING on port ${PORT}`);
   console.log(`✅ Health check available at: http://0.0.0.0:${PORT}/health`);
