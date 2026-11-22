@@ -48,9 +48,10 @@ const ALCHEMY_BSC_RPC_URL = String(
 const ENCRYPTION_KEY = process.env.ENCRYPTION_KEY;
 const API_SECRET_KEY = process.env.API_SECRET_KEY;
 
-// НАСТРОЙКИ АВТОСБОРА (только для BEP20)
+// НАСТРОЙКИ АВТОСБОРА
 const HOT_WALLET_PRIVATE_KEY = process.env.HOT_WALLET_PRIVATE_KEY; 
 const ADMIN_SWEEP_ADDRESS = process.env.ADMIN_SWEEP_ADDRESS;       
+let durableBscActive = false;
 
 if (!SUPABASE_SERVICE_ROLE_KEY) {
   console.error('❌ Missing SUPABASE_SERVICE_ROLE_KEY env');
@@ -195,6 +196,9 @@ const MIN_DEPOSIT = 30;
 // BSC
 const USDT_BSC_CONTRACT = '0x55d398326f99059fF775485246999027B3197955';
 const USDC_BSC_CONTRACT = '0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d';
+// Recovery of USDT accidentally sent to a registered EVM address on opBNB.
+// This does not add opBNB as a supported customer deposit network.
+const USDT_OPBNB_CONTRACT = '0x9e5AAC1Ba1a2e6aEd6b32689DFcF62A509Ca96f3';
 
 // Ethereum
 const USDT_ETH_CONTRACT = '0xdAC17F958D2ee523a2206206994597C13D831ec7';
@@ -504,6 +508,7 @@ function decryptPrivateKey(encryptedText) {
 
 // ========== AUTO-SWEEP LOGIC (BEP20) ==========
 async function sweepDepositBEP20(userId, token, network) {
+  if (durableBscActive) return; // The journalled BSC worker owns this wallet.
   if (!HOT_WALLET_PRIVATE_KEY || !ADMIN_SWEEP_ADDRESS) return;
 
   console.log(`🧹 Starting Auto-Sweep for user ${userId} (${token} on ${network})`);
@@ -2762,6 +2767,22 @@ app.get('/api/check-deposits', requireApiKey, async (req, res) => {
 });
 
 // ========== START SERVER ==========
+if (process.env.TREASURY_MODE && process.env.TREASURY_MODE !== 'off') {
+  try {
+    const treasuryChains = require('./treasury').startTreasury({
+      db: supabase, env: process.env, decrypt: decryptPrivateKey,
+      ethRpcUrl: ALCHEMY_ETH_RPC_URL,
+      contracts: {
+        usdt_bep20: USDT_BSC_CONTRACT, usdc_bep20: USDC_BSC_CONTRACT,
+        usdt_erc20: USDT_ETH_CONTRACT, usdc_erc20: USDC_ETH_CONTRACT,
+        usdt_opbnb: USDT_OPBNB_CONTRACT, usdt_trc20: USDT_TRON_CONTRACT
+      }
+    });
+    durableBscActive = process.env.TREASURY_MODE === 'live' && treasuryChains.includes('bsc');
+  } catch {
+    console.error('TREASURY_CONFIGURATION_INVALID: check recipients, chain policy and fee limits');
+  }
+}
 const server = app.listen(PORT, '0.0.0.0', () => {
   console.log(`🚀 HTTP SERVER RUNNING on port ${PORT}`);
   console.log(`✅ Health check available at: http://0.0.0.0:${PORT}/health`);
