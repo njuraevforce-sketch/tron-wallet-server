@@ -43,7 +43,7 @@ function checkTronIntent(tx, p) {
     )
       throw Error('TRON_TOKEN_INTENT_MISMATCH');
   } else if (
-    p.kind !== 'fund' || c.type !== 'TransferContract' ||
+    !['fund', 'trx_remainder'].includes(p.kind) || c.type !== 'TransferContract' ||
     !same(v.to_address, p.to) ||
     BigInt(v.amount) !== BigInt(p.amount)
   ) {
@@ -199,6 +199,42 @@ function tronAdapter(cfg) {
         projectedFee: fee,
       };
     },
+    async planRemainder(job, request, advance) {
+      const from = job.address;
+      if (!request || request.address !== from || request.receiver !== receiver ||
+          !sponsor || advance?.from !== sponsor || same(from, sponsor) || same(from, receiver) ||
+          !/^[1-9][0-9]{0,14}$/.test(request.balanceSun) ||
+          !/^[0-9]{1,9}$/.test(request.maxFeeSun) || BigInt(request.balanceSun) > BigInt(advance.amount))
+        return { hold: 'invalid_trx_remainder_request' };
+      if ((await balance(job.token, from)) !== 0n)
+        return { hold: 'trx_remainder_has_usdt' };
+      const [source, target, resources, rates] = await Promise.all([
+        account(from), account(receiver),
+        post('/wallet/getaccountresource', { address: from, visible: true }), prices(),
+      ]);
+      const coins = BigInt(integer(source.balance || 0));
+      if (!target.address || !source.address || coins === 0n || coins > BigInt(request.balanceSun))
+        return { hold: 'trx_remainder_balance_changed' };
+      const bandwidth = Math.max(
+        integer(resources.freeNetLimit || 0) - integer(resources.freeNetUsed || 0),
+        integer(resources.NetLimit || 0) - integer(resources.NetUsed || 0),
+      );
+      let amount = coins;
+      for (let i = 0; i < 3 && amount > 0n; i++) {
+        const tx = await tron.transactionBuilder.sendTrx(receiver, integer(amount), from);
+        const proto = TronWeb.utils.transaction.txJsonToPb(tx);
+        proto.addSignature(new Uint8Array(65));
+        // java-tron reserves 64 bytes for the transaction result.
+        const bytes = proto.serializeBinary().length + 64;
+        const fee = bandwidth >= bytes ? 0n : BigInt(bytes) * rates.bandwidth;
+        if (fee > BigInt(request.maxFeeSun) || fee > cfg.maxFee)
+          return { hold: 'trx_remainder_fee_limit' };
+        if (amount + fee === coins)
+          return { kind: 'trx_remainder', from, to: receiver, amount, fee, tx };
+        amount = coins - fee;
+      }
+      return { hold: 'trx_remainder_needs_bandwidth' };
+    },
     async sign(p, key, job) {
       const privateKey = p.kind === 'fund' ? sponsorKey : key.replace(/^0x/, '');
       if (!same(TronWeb.address.fromPrivateKey(privateKey), p.from))
@@ -217,6 +253,10 @@ function tronAdapter(cfg) {
         );
         if (!result.result?.result) throw Error('TRON_CONSTRUCTION_FAILED');
         tx = result.transaction;
+      } else if (p.kind === 'trx_remainder') {
+        if (!same(p.to, receiver) || !same(p.from, job.address) || same(p.from, sponsor))
+          throw Error('TRON_REMAINDER_INTENT_MISMATCH');
+        tx = p.tx;
       } else tx = await tron.transactionBuilder.sendTrx(p.to, integer(p.amount), p.from);
       checkTronIntent(tx, { ...p, token: job.token });
       const maxSize = p.kind === 'collect' ? 500 : 400;
@@ -233,6 +273,13 @@ function tronAdapter(cfg) {
       );
       if (receipt.id === p.hash && body.txID === p.hash) {
         if (body.ret?.[0]?.contractRet !== 'SUCCESS' || receipt.result === 'FAILED') return 'failed';
+        if (p.kind === 'trx_remainder') {
+          const c = body.raw_data?.contract;
+          const v = c?.[0]?.parameter?.value;
+          if (c?.length !== 1 || c[0].type !== 'TransferContract' || !v ||
+              !same(v.owner_address, p.from) || !same(v.to_address, receiver) ||
+              String(v.amount) !== String(p.amount)) return 'review';
+        }
         if (p.kind === 'collect') {
           if (receipt.receipt?.result !== 'SUCCESS') return 'failed';
           const logs = (receipt.log || []).map((l) => ({

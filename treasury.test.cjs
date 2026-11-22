@@ -490,3 +490,89 @@ test('TRON builds only USDT transfer calldata for a collection', () => {
   assert.throws(() => checkTronIntent(tx, { ...intent, to: from }), /MISMATCH/);
   assert.throws(() => checkTronIntent(tx, { ...intent, amount: '5000001' }), /MISMATCH/);
 });
+
+test('TRX remainder uses confirmed gas and empties the wallet net of exact serialized bandwidth', async () => {
+  const privateKey = Wallet.createRandom().privateKey.slice(2);
+  const address = TronWeb.address.fromPrivateKey(privateKey);
+  const receiver = TronWeb.address.fromPrivateKey(recipient.privateKey.slice(2));
+  const sponsor = TronWeb.address.fromPrivateKey(owner.privateKey.slice(2));
+  const job = {address, token: contracts.usdt_trc20};
+  const request = {address, receiver, balanceSun: '9071500', maxFeeSun: '400000'};
+  const advance = {from: sponsor, amount: '15500000'};
+  const originalFetch = global.fetch;
+  const builder = TronWeb.TransactionBuilder.prototype;
+  const originalSend = builder.sendTrx;
+  let bandwidth = 0, balance = 9071500, usdt = 0;
+  global.fetch = async (url, opts) => {
+    const body = JSON.parse(opts.body);
+    let data;
+    if (url.endsWith('/triggerconstantcontract'))
+      data = {result:{result:true},constant_result:[BigInt(usdt).toString(16).padStart(64,'0')]};
+    else if (url.endsWith('/getaccount'))
+      data = {address: body.address, balance: body.address === address ? balance : 1000000};
+    else if (url.endsWith('/getaccountresource')) data = {freeNetLimit: bandwidth};
+    else if (url.endsWith('/getchainparameters')) data = {chainParameter:[
+      {key:'getEnergyFee',value:100}, {key:'getTransactionFee',value:1000},
+      {key:'getCreateNewAccountFeeInSystemContract',value:1000000}, {key:'getCreateAccountFee',value:100000},
+    ]};
+    else throw Error('UNEXPECTED_RPC');
+    return {ok:true, json:async()=>data};
+  };
+  builder.sendTrx = async (to, amount, from) => {
+    const now = Date.now();
+    const tx = {raw_data:{contract:[{parameter:{value:{amount, owner_address:TronWeb.address.toHex(from),
+      to_address:TronWeb.address.toHex(to)}, type_url:'type.googleapis.com/protocol.TransferContract'},
+      type:'TransferContract'}], ref_block_bytes:'1337', ref_block_hash:'1234567812345678',
+      expiration:now+60000, timestamp:now}};
+    const u = TronWeb.utils.transaction;
+    tx.raw_data_hex = u.txPbToRawDataHex(u.txJsonToPb(tx)).toLowerCase();
+    tx.txID = sha256('0x'+tx.raw_data_hex).slice(2);
+    return tx;
+  };
+  try {
+    const a = tronAdapter({tronBase:'https://api.trongrid.io',receiver,gasKey:owner.privateKey,maxFee:25000000n});
+    const paid = await a.planRemainder(job, request, advance);
+    assert.equal(paid.kind, 'trx_remainder');
+    assert.equal(paid.amount + paid.fee, BigInt(balance));
+    const signed = await a.sign(paid, privateKey, job);
+    const proto = TronWeb.utils.transaction.txJsonToPb(paid.tx);
+    proto.addSignature(Buffer.from(signed.raw.signature[0], 'hex'));
+    assert.equal(paid.fee, BigInt(proto.serializeBinary().length + 64)*1000n);
+    assert.ok(paid.fee > 0n);
+    assert.equal((await a.planRemainder(job,{...request,maxFeeSun:'1'},advance)).hold,'trx_remainder_fee_limit');
+    bandwidth = 600;
+    const free = await a.planRemainder(job, request, advance);
+    assert.equal(free.fee, 0n);
+    assert.equal(free.amount, BigInt(balance));
+    assert.equal((await a.planRemainder(job,{...request,receiver:sponsor},advance)).hold,'invalid_trx_remainder_request');
+    assert.equal((await a.planRemainder(job,request,{...advance,amount:'1'})).hold,'invalid_trx_remainder_request');
+    balance += 1;
+    assert.equal((await a.planRemainder(job,request,advance)).hold,'trx_remainder_balance_changed');
+    usdt = 1;
+    assert.equal((await a.planRemainder(job,request,advance)).hold,'trx_remainder_has_usdt');
+  } finally {
+    global.fetch = originalFetch;
+    builder.sendTrx = originalSend;
+  }
+});
+
+test('TRX remainder rejects an unconfirmed collection before fetching the signing envelope', async () => {
+  const address = TronWeb.address.fromPrivateKey(owner.privateKey.slice(2));
+  const receiver = TronWeb.address.fromPrivateKey(recipient.privateKey.slice(2));
+  const config = {name:'tron', receiver, networks:['usdt_trc20'], projection:'user_id,usdt_trc20_address',
+    tokens:[{address:contracts.usdt_trc20,symbol:'USDT',minimum:1n}],dailyFee:1n};
+  const cursor = {user:uid,position:0,tronRemainder:{address,receiver,fundingHash:'1'.repeat(64),
+    collectionHash:'2'.repeat(64),expires:Date.now()+60000}};
+  const calls = [];
+  const db = {async rpc(name,args) {
+    if (name==='treasury_claim') return {data:[{revision:1,cursor_state:cursor,pending:null}]};
+    assert.equal(name,'treasury_advance');
+    calls.push(args.p_hold);
+    return {data:true};
+  }, from(table) {
+    return {select(){return this},eq(){return this},in(){return {data:[]}},
+      maybeSingle(){assert.equal(table,'deposit_wallets');return {data:{user_id:uid,usdt_trc20_address:address}}}};
+  }};
+  await step(db,config,{},()=>{throw Error('unexpected key lookup')},()=>{},uid);
+  assert.deepEqual(calls,['trx_remainder_receipts_unconfirmed']);
+});
