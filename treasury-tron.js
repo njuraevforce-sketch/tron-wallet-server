@@ -158,10 +158,11 @@ function tronAdapter(cfg) {
         const ret = simulation.constant_result[0];
         const validEnergy = Number.isSafeInteger(simulation.energy_used) &&
           simulation.energy_used > 0;
+        const quotedTransfer = /^0{64}$/.test(ret || '') && usdtTransferEvent(
+          simulation, job.token, hex20(from), hex20(receiver), amount
+        );
         const positive = ret === '' || /^0{63}1$/.test(ret || '') ||
-          (a.address && /^0{64}$/.test(ret || '') && usdtTransferEvent(
-            simulation, job.token, hex20(from), hex20(receiver), amount
-          ));
+          (a.address && quotedTransfer);
         if (!validEnergy || (!positive && !(!a.address && /^0{64}$/.test(ret || ''))))
           return funded ? { hold: 'funded_wallet_simulation_rejected' } : { skip: 'simulation_rejected' };
         // TRON can return `false` when simulating from an unactivated account
@@ -171,7 +172,9 @@ function tronAdapter(cfg) {
           return funded ? { hold: 'funded_wallet_simulation_rejected' } : { skip: 'inactive_needs_energy_estimate' };
         const quoted = (BigInt(simulation.energy_used) * rates.energy * 120n + 99n) / 100n;
         const activation = cfg.activationEnergy * rates.energy;
-        energyLimit = !positive && activation > quoted ? activation : quoted;
+        // A matched USDT event gives a measured quote even before account activation.
+        // Collection still requires the activated account to pass a fresh simulation.
+        energyLimit = !positive && !quotedTransfer && activation > quoted ? activation : quoted;
       } else {
         energyLimit = cfg.activationEnergy * rates.energy;
       }

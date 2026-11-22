@@ -339,6 +339,16 @@ test('inactive TRON wallet is funded within cap, then must pass a fresh transfer
       data: (50000000n).toString(16).padStart(64, '0'),
     };
     simulationDetails = { transaction: { ret: [{}] }, logs: [event] };
+    active = false;
+    simulationDetails.energy_used = 64285;
+    const measured = await adapter.plan(job, false);
+    assert.equal(measured.kind, 'fund');
+    assert.equal(measured.amount, 8214200n);
+    assert.equal((await adapter.plan(job, true)).hold, 'funded_wallet_simulation_rejected');
+    simulationDetails.logs = [{ ...event, data: '0'.repeat(64) }];
+    assert.equal((await adapter.plan(job, false)).amount, 15500000n);
+    simulationDetails.logs = [event];
+    active = true;
     const simulated = await adapter.plan(job, true);
     assert.equal(simulated.kind, 'collect');
     assert.equal(simulated.to, receiver);
