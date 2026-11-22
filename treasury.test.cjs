@@ -5,7 +5,7 @@ const { Wallet, Interface, keccak256, Transaction, sha256 } = require('ethers');
 const TronWeb = require('tronweb');
 const { configs, jobsFor, nextCursor, step } = require('./treasury');
 const { evmAdapter, matchingTransfer, isPositiveTransfer } = require('./treasury-evm');
-const { checkTronIntent } = require('./treasury-tron');
+const { tronAdapter, checkTronIntent } = require('./treasury-tron');
 
 const owner = Wallet.createRandom(),
   recipient = Wallet.createRandom(),
@@ -282,6 +282,58 @@ test('TRON transaction field and byte validation works with genuinely serialized
   checkTronIntent(tx, intent);
   assert.throws(() => checkTronIntent(tx, { ...intent, amount: 12 }), /MISMATCH/);
   assert.throws(() => checkTronIntent({ ...tx, raw_data_hex: 'abcd' }, intent), /INVALID/);
+});
+test('inactive TRON wallet is funded within cap, then must pass a fresh transfer simulation', async () => {
+  const deposit = TronWeb.address.fromPrivateKey(Wallet.createRandom().privateKey.slice(2));
+  const receiver = TronWeb.address.fromPrivateKey(recipient.privateKey.slice(2));
+  const sponsor = TronWeb.address.fromPrivateKey(owner.privateKey.slice(2));
+  const originalFetch = global.fetch;
+  let active = false;
+  let transferable = false;
+  global.fetch = async (url, opts) => {
+    const body = JSON.parse(opts.body);
+    let response;
+    if (url.endsWith('/walletsolidity/getaccount')) {
+      response = body.address === sponsor ? { address: sponsor, balance: 200000000 }
+        : active ? { address: deposit, balance: 17000000 } : {};
+    } else if (url.endsWith('/wallet/getchainparameters')) {
+      response = { chainParameter: [
+        { key: 'getTransactionFee', value: 1000 },
+        { key: 'getEnergyFee', value: 100 },
+        { key: 'getCreateNewAccountFeeInSystemContract', value: 1000000 },
+        { key: 'getCreateAccountFee', value: 100000 },
+      ] };
+    } else if (url.endsWith('/wallet/triggerconstantcontract')) {
+      const isBalance = body.function_selector === 'balanceOf(address)';
+      response = { result: { result: true }, constant_result: [isBalance
+        ? (50000000).toString(16).padStart(64, '0')
+        : (transferable ? '1' : '0').padStart(64, '0')], energy_used: 130285 };
+    } else throw Error('UNEXPECTED_TEST_RPC');
+    return { ok: true, json: async () => response };
+  };
+  try {
+    const adapter = tronAdapter({
+      tronBase: 'https://api.trongrid.io', receiver, gasKey: owner.privateKey,
+      activationEnergy: 150000n, maxFee: 25000000n,
+    });
+    const job = { address: deposit, token: contracts.usdt_trc20, minimum: 1000000n };
+    const advance = await adapter.plan(job, false);
+    assert.equal(advance.kind, 'fund');
+    assert.equal(advance.from, sponsor);
+    assert.equal(advance.to, deposit);
+    assert.ok(advance.amount > 15000000n);
+    assert.ok(advance.fee + advance.projectedFee <= 25000000n);
+    assert.equal((await adapter.plan(job, true)).hold, 'funded_wallet_simulation_rejected');
+    active = true;
+    assert.equal((await adapter.plan(job, true)).hold, 'funded_wallet_simulation_rejected');
+    transferable = true;
+    const collection = await adapter.plan(job, true);
+    assert.equal(collection.kind, 'collect');
+    assert.equal(collection.to, receiver);
+    assert.equal(collection.amount, 50000000n);
+  } finally {
+    global.fetch = originalFetch;
+  }
 });
 test('EVM plans a bounded gas advance only for an actual eligible token balance', async () => {
   const abi = new Interface([

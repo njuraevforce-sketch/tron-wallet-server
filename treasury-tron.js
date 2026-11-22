@@ -127,17 +127,25 @@ function tronAdapter(cfg) {
         );
       } catch (e) {
         if (a.address || e.message !== 'TRON_SIMULATION_FAILED') throw e;
+        if (funded) return { hold: 'funded_wallet_simulation_rejected' };
         if (!cfg.activationEnergy) return { skip: 'inactive_needs_energy_estimate' };
       }
       let energyLimit;
       if (simulation) {
         const ret = simulation.constant_result[0];
-        if (
-          !(ret === '' || /^0{63}1$/.test(ret || '')) ||
-          !Number.isSafeInteger(simulation.energy_used) ||
-          simulation.energy_used <= 0
-        ) return { skip: 'simulation_rejected' };
-        energyLimit = (BigInt(simulation.energy_used) * rates.energy * 120n + 99n) / 100n;
+        const validEnergy = Number.isSafeInteger(simulation.energy_used) &&
+          simulation.energy_used > 0;
+        const positive = ret === '' || /^0{63}1$/.test(ret || '');
+        if (!validEnergy || (!positive && !(!a.address && /^0{64}$/.test(ret || ''))))
+          return funded ? { hold: 'funded_wallet_simulation_rejected' } : { skip: 'simulation_rejected' };
+        // TRON can return `false` when simulating from an unactivated account
+        // that already holds USDT. Advance gas only after proving custody; once
+        // activated, require a new successful simulation before collecting.
+        if (!positive && (!cfg.activationEnergy || funded))
+          return funded ? { hold: 'funded_wallet_simulation_rejected' } : { skip: 'inactive_needs_energy_estimate' };
+        const quoted = (BigInt(simulation.energy_used) * rates.energy * 120n + 99n) / 100n;
+        const activation = cfg.activationEnergy * rates.energy;
+        energyLimit = !positive && activation > quoted ? activation : quoted;
       } else {
         energyLimit = cfg.activationEnergy * rates.energy;
       }
