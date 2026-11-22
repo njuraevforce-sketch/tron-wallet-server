@@ -161,6 +161,26 @@ async function selectJob(db, cfg, input) {
   const job = jobs[c.position];
   return { cursor: c, next: nextCursor(c, c.position + 1 >= jobs.length), job };
 }
+// A native remainder is a separate, explicitly requested operation after a confirmed USDT collection.
+async function remainderPlan(db, cfg, adapter, job, request) {
+  if (cfg.name !== 'tron' || request.address !== job.address || request.receiver !== cfg.receiver ||
+      !/^[0-9a-f]{64}$/.test(request.collectionHash || '') ||
+      !/^[0-9a-f]{64}$/.test(request.fundingHash || '') ||
+      !Number.isSafeInteger(request.expires) || request.expires <= Date.now())
+    return { hold: 'invalid_trx_remainder_request' };
+  const receipts = checked(await db.from('treasury_transfers').select('tx_hash,recorded_at,details')
+    .eq('chain', 'tron').in('tx_hash', [request.collectionHash, request.fundingHash]));
+  const collection = receipts.find(r => r.tx_hash === request.collectionHash);
+  const advance = receipts.find(r => r.tx_hash === request.fundingHash);
+  const c = collection?.details, f = advance?.details;
+  if (c?.kind !== 'collect' || c.state !== 'confirmed' || c.token !== job.token ||
+      c.from !== job.address || c.to !== cfg.receiver ||
+      f?.kind !== 'fund' || f.state !== 'confirmed' || f.token !== job.token ||
+      f.to !== job.address || f.receiver !== cfg.receiver ||
+      Date.parse(advance.recorded_at) > Date.parse(collection.recorded_at))
+    return { hold: 'trx_remainder_receipts_unconfirmed' };
+  return adapter.planRemainder(job, request, f);
+}
 async function step(db, cfg, adapter, unlock, log, owner) {
   const [lane] = checked(await db.rpc('treasury_claim', { p_chain: cfg.name, p_worker: owner }));
   if (!lane) return false;
@@ -182,7 +202,11 @@ async function step(db, cfg, adapter, unlock, log, owner) {
     );
   }
   if (pending) {
-    if (!['fund', 'collect'].includes(pending.kind) || !cfg.tokens.some((t) => t.address === pending.token)) {
+    const remainder = pending.kind === 'trx_remainder' && cfg.name === 'tron' &&
+      c.tronRemainder?.address === pending.from && c.tronRemainder?.receiver === pending.to &&
+      pending.to === cfg.receiver && pending.collectionHash === c.tronRemainder?.collectionHash;
+    if ((!['fund', 'collect'].includes(pending.kind) && !remainder) ||
+        !cfg.tokens.some((t) => t.address === pending.token)) {
       await save(c, pending, 0n, null, 'unsupported_pending_asset');
       return false;
     }
@@ -227,7 +251,9 @@ async function step(db, cfg, adapter, unlock, log, owner) {
     await save(cursor, null, 0n, null, 'wallet_changed_after_funding');
     return false;
   }
-  const plan = await adapter.plan(job, !!cursor.funded);
+  const plan = cursor.tronRemainder
+    ? await remainderPlan(db, cfg, adapter, job, cursor.tronRemainder)
+    : await adapter.plan(job, !!cursor.funded);
   if (plan.hold) {
     await save(cursor, null, 0n, null, plan.hold);
     return false;
@@ -275,7 +301,8 @@ async function step(db, cfg, adapter, unlock, log, owner) {
     from: plan.from,
     to: plan.to,
     token: job.token,
-    symbol: plan.kind === 'fund' ? cfg.symbol : job.symbol,
+    symbol: plan.kind === 'collect' ? job.symbol : cfg.symbol,
+    ...(plan.kind === 'trx_remainder' ? { collectionHash: cursor.tronRemainder.collectionHash } : {}),
     sourceAsset: job.symbol,
     amount: String(plan.amount),
     fee: String(plan.fee),
