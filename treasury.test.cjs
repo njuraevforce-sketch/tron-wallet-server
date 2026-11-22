@@ -290,6 +290,7 @@ test('inactive TRON wallet is funded within cap, then must pass a fresh transfer
   const originalFetch = global.fetch;
   let active = false;
   let transferable = false;
+  let simulationDetails = {};
   global.fetch = async (url, opts) => {
     const body = JSON.parse(opts.body);
     let response;
@@ -308,6 +309,7 @@ test('inactive TRON wallet is funded within cap, then must pass a fresh transfer
       response = { result: { result: true }, constant_result: [isBalance
         ? (50000000).toString(16).padStart(64, '0')
         : (transferable ? '1' : '0').padStart(64, '0')], energy_used: 130285 };
+      if (!isBalance) Object.assign(response, simulationDetails);
     } else throw Error('UNEXPECTED_TEST_RPC');
     return { ok: true, json: async () => response };
   };
@@ -326,6 +328,34 @@ test('inactive TRON wallet is funded within cap, then must pass a fresh transfer
     assert.equal((await adapter.plan(job, true)).hold, 'funded_wallet_simulation_rejected');
     active = true;
     assert.equal((await adapter.plan(job, true)).hold, 'funded_wallet_simulation_rejected');
+    // Mainnet USDT returns false even when the VM simulated the intended transfer.
+    const addressTopic = a => TronWeb.address.toHex(a).slice(2).toLowerCase().padStart(64, '0');
+    const event = {
+      address: 'G9AHnMvAgqKJ2eWErupYfdzu6hgWVUZqu',
+      topics: [
+        'ddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef',
+        addressTopic(deposit), addressTopic(receiver),
+      ],
+      data: (50000000n).toString(16).padStart(64, '0'),
+    };
+    simulationDetails = { transaction: { ret: [{}] }, logs: [event] };
+    const simulated = await adapter.plan(job, true);
+    assert.equal(simulated.kind, 'collect');
+    assert.equal(simulated.to, receiver);
+    assert.equal(simulated.amount, 50000000n);
+    assert.equal((await adapter.plan({ ...job, token: sponsor }, true)).hold, 'funded_wallet_simulation_rejected');
+    for (const wrong of [
+      { logs: [{ ...event, address: receiver }] },
+      { logs: [{ ...event, topics: [event.topics[0], addressTopic(receiver), addressTopic(deposit)] }] },
+      { logs: [{ ...event, data: '0'.repeat(64) }] },
+      { logs: [event, event] },
+      { logs: [event], transaction: { ret: [{ ret: 'FAILED' }] } },
+      { logs: [event], energy_used: 0 },
+    ]) {
+      simulationDetails = wrong;
+      assert.equal((await adapter.plan(job, true)).hold, 'funded_wallet_simulation_rejected');
+    }
+    simulationDetails = {};
     transferable = true;
     const collection = await adapter.plan(job, true);
     assert.equal(collection.kind, 'collect');

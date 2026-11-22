@@ -53,6 +53,25 @@ function checkTronIntent(tx, p) {
     throw Error('TRON_INVALID_EXPIRY');
 }
 
+function usdtTransferEvent(sim, token, fromHex, toHex, amount) {
+  // With visible:true TronGrid may encode the 20-byte log address without the 0x41 prefix.
+  if (token !== 'TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t') return false;
+  const emitters = [
+    token, 'G9AHnMvAgqKJ2eWErupYfdzu6hgWVUZqu',
+    'a614f803b6fd780986a42c78ec9c7f77e6ded13c',
+    '41a614f803b6fd780986a42c78ec9c7f77e6ded13c',
+  ];
+  const signature = 'ddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef';
+  const word = h => h.slice(2).toLowerCase().padStart(64, '0');
+  const transfers = (Array.isArray(sim.logs) ? sim.logs : []).filter(l =>
+    emitters.includes(l?.address) && l.topics?.[0]?.toLowerCase() === signature);
+  if (transfers.length !== 1) return false;
+  const ev = transfers[0];
+  return ev.topics.length === 3 && ev.topics[1]?.toLowerCase() === word(fromHex)
+    && ev.topics[2]?.toLowerCase() === word(toHex)
+    && ev.data?.toLowerCase() === amount.toString(16).padStart(64, '0');
+}
+
 function tronAdapter(cfg) {
   const base = cfg.tronBase;
   const headers = { 'TRON-PRO-API-KEY': cfg.apiKey || '' };
@@ -132,10 +151,17 @@ function tronAdapter(cfg) {
       }
       let energyLimit;
       if (simulation) {
+        const failed = simulation.result?.result !== true || simulation.result?.message ||
+          simulation.resMessage || simulation.transaction?.ret?.some(entry =>
+            [entry.ret, entry.contractRet].some(v => v != null && v !== 'SUCCESS'));
+        if (failed) return funded ? { hold: 'funded_wallet_simulation_rejected' } : { skip: 'simulation_rejected' };
         const ret = simulation.constant_result[0];
         const validEnergy = Number.isSafeInteger(simulation.energy_used) &&
           simulation.energy_used > 0;
-        const positive = ret === '' || /^0{63}1$/.test(ret || '');
+        const positive = ret === '' || /^0{63}1$/.test(ret || '') ||
+          (a.address && /^0{64}$/.test(ret || '') && usdtTransferEvent(
+            simulation, job.token, hex20(from), hex20(receiver), amount
+          ));
         if (!validEnergy || (!positive && !(!a.address && /^0{64}$/.test(ret || ''))))
           return funded ? { hold: 'funded_wallet_simulation_rejected' } : { skip: 'simulation_rejected' };
         // TRON can return `false` when simulating from an unactivated account
