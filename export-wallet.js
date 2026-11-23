@@ -1,6 +1,8 @@
 #!/usr/bin/env node
 const { createClient } = require('@supabase/supabase-js');
 const crypto = require('crypto');
+const { Wallet, getAddress } = require('ethers');
+const TronWeb = require('tronweb');
 const WebSocket = require('ws'); // ИСПРАВЛЕНИЕ: Добавлен пакет ws
 
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://fctwivbwjoslkejtjxhe.supabase.co';
@@ -26,35 +28,57 @@ function maskPrivateKey(key) {
   return `${key.slice(0, 8)}...${key.slice(-8)}`;
 }
 
-function decryptPrivateKey(encryptedText) {
-  if (!encryptedText) {
-    throw new Error('Empty encrypted_private_key');
-  }
-
-  if (!ENCRYPTION_KEY || String(ENCRYPTION_KEY).length < 32) {
+function decryptPrivateKey(serverCipher) {
+  if (!ENCRYPTION_KEY || ENCRYPTION_KEY.length < 32) {
     throw new Error('Missing or invalid ENCRYPTION_KEY');
   }
 
-  // Backward compatibility: some old rows may still contain plain text.
-  if (!encryptedText.includes(':')) {
-    return encryptedText;
+  const parts = typeof serverCipher === 'string' ? serverCipher.split(':') : [];
+  const modern = parts.length === 4 && parts[0] === 'v1';
+  if (!modern && parts.length !== 3) {
+    throw new Error('Invalid server_cipher envelope');
   }
 
-  const [ivHex, encryptedHex, authTagHex] = encryptedText.split(':');
-  if (!ivHex || !encryptedHex || !authTagHex) {
-    throw new Error('Invalid encrypted_private_key format');
+  const [ivHex, cipherHex, tagHex] = modern
+    ? [parts[1], parts[3], parts[2]]
+    : parts;
+  const ivPattern = modern ? /^[a-f0-9]{24}$/ : /^[a-f0-9]{32}$/;
+  if (!ivPattern.test(ivHex) || !/^[a-f0-9]{32}$/.test(tagHex) ||
+      !/^(?:[a-f0-9]{2})+$/.test(cipherHex)) {
+    throw new Error('Invalid server_cipher envelope');
   }
 
-  const iv = Buffer.from(ivHex, 'hex');
-  const authTag = Buffer.from(authTagHex, 'hex');
-  const key = crypto.createHash('sha256').update(ENCRYPTION_KEY).digest();
+  const aesKey = crypto.createHash('sha256').update(ENCRYPTION_KEY).digest();
+  const decipher = crypto.createDecipheriv('aes-256-gcm', aesKey, Buffer.from(ivHex, 'hex'));
+  decipher.setAuthTag(Buffer.from(tagHex, 'hex'));
+  const privateKey = decipher.update(cipherHex, 'hex', 'utf8') + decipher.final('utf8');
+  if (!/^(?:0x)?[0-9a-fA-F]{64}$/.test(privateKey)) {
+    throw new Error('Invalid decrypted private key');
+  }
+  return privateKey;
+}
 
-  const decipher = crypto.createDecipheriv('aes-256-gcm', key, iv);
-  decipher.setAuthTag(authTag);
+function verifyWalletAddress(privateKey, address, isTron) {
+  const hexKey = privateKey.replace(/^0x/, '');
+  if (isTron) {
+    const derived = TronWeb.address.fromPrivateKey(hexKey);
+    if (!derived || !TronWeb.isAddress(address) ||
+        TronWeb.address.toHex(derived).toLowerCase() !== TronWeb.address.toHex(address).toLowerCase()) {
+      throw new Error('Private key does not match the registered TRON address');
+    }
+    return;
+  }
 
-  let decrypted = decipher.update(encryptedHex, 'hex', 'utf8');
-  decrypted += decipher.final('utf8');
-  return decrypted;
+  let derived;
+  try {
+    derived = new Wallet('0x' + hexKey).address;
+  } catch {
+    throw new Error('Invalid EVM private key');
+  }
+
+  if (derived !== getAddress(address.toLowerCase())) {
+    throw new Error('Private key does not match the registered EVM address');
+  }
 }
 
 function parseArgs(argv) {
@@ -100,6 +124,7 @@ Examples:
 Notes:
   --json    Print machine-readable JSON
   --masked  Mask private_key output for safer viewing
+  For opBNB, use usdt_bep20 only when its registered address matches your opBNB wallet.
 `);
 }
 
@@ -130,28 +155,29 @@ async function main() {
     }
   });
 
-  const { data, error } = await supabase
-    .from('deposit_private_keys')
-    .select('user_id, network, address, encrypted_private_key, created_at')
-    .eq('user_id', userId)
-    .eq('network', network)
-    .maybeSingle();
+  const isTron = ['trx', 'usdt_trc20', 'trc_20'].includes(network);
+  const lookupNetwork = isTron ? 'usdt_trc20' : network;
+  const { data, error } = await supabase.rpc('deposit_key_envelope', {
+    p_user_id: userId,
+    p_network: lookupNetwork,
+  });
 
   if (error) {
     fail(`Supabase error: ${error.message}`);
   }
 
-  if (!data) {
-    fail('Wallet not found');
+  if (!data || typeof data.address !== 'string' || typeof data.server_cipher !== 'string') {
+    fail('Wallet or encrypted key not found');
   }
 
-  const privateKey = decryptPrivateKey(data.encrypted_private_key);
+  const privateKey = decryptPrivateKey(data.server_cipher);
+  verifyWalletAddress(privateKey, data.address, isTron);
   const output = {
-    user_id: data.user_id,
-    network: data.network,
+    user_id: userId,
+    network,
     address: data.address,
     private_key: masked ? maskPrivateKey(privateKey) : privateKey,
-    created_at: data.created_at,
+    created_at: data.created_at ?? null,
   };
 
   if (json) {
