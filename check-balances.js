@@ -391,16 +391,38 @@ function addTronAddress(map, address, userId) {
   }
 }
 
+async function readAllRows(buildQuery) {
+  const pageSize = 1000;
+  const rows = [];
+
+  for (;;) {
+    const offset = rows.length;
+    const { data: page, error } = await buildQuery().range(offset, offset + pageSize - 1);
+    if (error) {
+      throw new Error(`Supabase rows starting at offset ${offset}: ${error.message}`);
+    }
+    if (!Array.isArray(page)) {
+      throw new Error(`Supabase returned an invalid page at offset ${offset}`);
+    }
+    if (page.length === 0) return rows;
+
+    // Advance by the rows actually returned if the API caps the page size.
+    rows.push(...page);
+  }
+}
+
 async function loadWalletsFromDatabase(supabase) {
   console.log('Loading wallets from DB...');
 
-  const { data: wallets, error } = await supabase
+  const wallets = await readAllRows(() => supabase
     .from('deposit_wallets')
-    .select('*');
-
-  if (error) {
-    throw new Error(`DB Error deposit_wallets: ${error.message}`);
-  }
+    .select(
+      'user_id, usdt_bep20_address, usdc_bep20_address, ' +
+      'usdt_erc20_address, usdc_erc20_address, usdt_trc20_address'
+    )
+    .order('user_id', { ascending: true }),
+  );
+  console.log(`Loaded deposit_wallets rows: ${wallets.length}`);
 
   const evmWallets = new Map();
   const tronWallets = new Map();
@@ -433,22 +455,23 @@ async function loadWalletsFromDatabase(supabase) {
     );
   }
 
-  // Fallback for old rows or rows where user_wallets.usdt_trc20_address is
-  // missing, but private_keys still contains the public TRON address.
-  const { data: privateKeys, error: pkError } = await supabase
-    .from('deposit_private_keys')
-    .select('user_id, network, address')
-    .in('network', ['usdt_trc20', 'trx', 'trc_20', 'trc20', 'tron'])
-    .not('address', 'is', null);
-
-  if (pkError) {
-    console.error(
-      `WARNING: private_keys fallback skipped: ${pkError.message}`
+  // Older deployments may still expose public TRON addresses in this table.
+  try {
+    const legacyAddresses = await readAllRows(() => supabase
+      .from('deposit_private_keys')
+      .select('user_id, network, address')
+      .in('network', ['usdt_trc20', 'trx', 'trc_20', 'trc20', 'tron'])
+      .not('address', 'is', null)
+      .order('user_id', { ascending: true })
+      .order('network', { ascending: true })
+      .order('address', { ascending: true }),
     );
-  } else {
-    for (const keyRow of privateKeys || []) {
-      addTronAddress(tronWallets, keyRow.address, keyRow.user_id);
+
+    for (const row of legacyAddresses) {
+      addTronAddress(tronWallets, row.address, row.user_id);
     }
+  } catch (error) {
+    console.error(`WARNING: TRON address fallback skipped: ${error.message}`);
   }
 
   return {
